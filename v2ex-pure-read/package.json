@@ -1,0 +1,13 @@
+{
+  "name": "v2ex-pure-read",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Development checks for the standalone V2EX reading userscript",
+  "scripts": {
+    "check": "node --check v2ex-pure-read.user.js",
+    "test": "node --test tests/reader.test.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}
