@@ -271,3 +271,250 @@ test('template save and cross-site import still replay the recorded values', asy
   await run(target); await expand(target, 'templateDetails'); await ctl(target, 'overwrite').check(); await run(target, 'replay');
   assert.deepEqual(await values(target), original);
 });
+
+// The live page uses plain div captions and anonymous Ant Design number inputs.
+// Deliberately different class names ensure recognition does not depend on that app.
+const decimalHint = '请输入普通十进制数';
+function decimalField(label, value = '1.5') {
+  return `<div class="custom-cell-a94"><div class="caption-b37">${label}</div><div class="ant-input-number"><input role="spinbutton" aria-valuemin="0.0001" aria-valuemax="9999999999.9999" step="0.0001" placeholder="${decimalHint}" value="${value}"></div></div>`;
+}
+function economicForm(labels = ['工业总产值（亿元）', '工业增加值（亿元）']) {
+  return `<div id="editor"><div><h2>经济数据</h2></div><div class="body-c42"><div class="layout-d56">${labels.map((label, i) => decimalField(label, `${i + 1}.5`)).join('')}</div></div></div>`;
+}
+function oldDescriptor(overrides = {}) {
+  return { kind: 'number', type: 'text', name: '', id: '', testid: '', label: decimalHint, context: '', placeholder: decimalHint, ...overrides };
+}
+function oldKey(descriptor) {
+  let hash = 2166136261;
+  for (const char of JSON.stringify(descriptor)) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+  return (hash >>> 0).toString(36);
+}
+function oldDatabase(rules = {}, templates = [], scope = 'body') {
+  return { [DATABASE]: JSON.stringify({ schema: 1, rules: { [`http://localhost/editor::${scope}`]: rules }, settings: {}, templates }) };
+}
+function oldTemplate(descriptors, values) {
+  return { id: 'legacy-template', name: '已有模板', page: { origin: 'http://localhost', path: '/editor', title: '资料编辑' }, scope: 'body', fields: descriptors.map((descriptor, index) => ({ descriptor, value: values[index] })) };
+}
+async function fieldNames(page) { return page.locator('#tfa-host-v1 .field-name').allTextContents(); }
+
+test('custom div captions distinguish equal placeholders for fill, rules, dice, locate and undo', async t => {
+  const env = await setup(t, { content: economicForm(), store: { [INLINE]: true } }), page = await env.openPage();
+  const original = await values(page), controls = page.locator('#editor input');
+  await page.locator('#tfa-host-v1 .field-dice').first().waitFor();
+  assert.equal(await page.locator('#tfa-host-v1 .field-dice').count(), 2);
+  assert.deepEqual(await fieldNames(page), ['工业总产值（亿元）', '工业增加值（亿元）']);
+  await settings(page); await expand(page, 'fieldDetails');
+  assert.deepEqual(await page.locator('#tfa-host-v1 .field .meta').allTextContents(), ['经济数据', '经济数据']);
+  const rows = page.locator('#tfa-host-v1 .field');
+  assert.notEqual(await rows.nth(0).getAttribute('data-key'), await rows.nth(1).getAttribute('data-key'));
+  await rows.nth(1).locator('.locate').click();
+  assert.match(await controls.nth(1).getAttribute('style'), /outline/); assert.equal(await controls.nth(0).getAttribute('style'), null);
+  for (let i = 0; i < 2; i++) {
+    await rows.nth(i).locator('.mode').selectOption('fixed'); await rows.nth(i).locator('.fixed').fill(String((i + 1) * 101));
+  }
+  await run(page); assert.deepEqual(await values(page), ['101', '202']);
+  await run(page, 'undo'); assert.deepEqual(await values(page), original);
+  await rows.nth(1).locator('.random-one').click(); await idle(page);
+  assert.deepEqual(await values(page), [original[0], '202']);
+  await run(page, 'undo'); assert.deepEqual(await values(page), original);
+  await page.reload(); await page.addScriptTag({ content: script }); await page.locator('#tfa-host-v1').waitFor();
+  await reveal(page); await run(page); assert.deepEqual(await values(page), ['101', '202']);
+});
+
+test('unlabelled duplicates use independent live controls and session rules without exporting ambiguous identities', async t => {
+  const content = '<form id="editor"><div><input placeholder="请输入" value="甲"></div><div><input placeholder="请输入" value="乙"></div></form>';
+  const env = await setup(t, { content, store: { [INLINE]: true } }), page = await env.openPage();
+  await page.locator('#tfa-host-v1 .field-dice').first().waitFor();
+  assert.equal(await page.locator('#tfa-host-v1 .field-dice').count(), 2);
+  await page.locator('#tfa-host-v1 .field-dice').nth(1).click({ button: 'right' });
+  assert.equal(await page.evaluate(() => document.getElementById('tfa-host-v1').shadowRoot.activeElement.closest('.field').dataset.key), await page.locator('#tfa-host-v1 .field').nth(1).getAttribute('data-key'));
+  await settings(page); await expand(page, 'fieldDetails'); const rows = page.locator('#tfa-host-v1 .field');
+  assert.equal(await rows.count(), 2); assert.match(await rows.nth(1).locator('.rule-warning').textContent(), /仅当前控件/);
+  await rows.nth(1).locator('.locate').click(); assert.equal(await page.locator('#editor input').nth(0).getAttribute('style'), null);
+  for (let i = 0; i < 2; i++) { await rows.nth(i).locator('.mode').selectOption('fixed'); await rows.nth(i).locator('.fixed').fill(['单独甲', '单独乙'][i]); }
+  await run(page); assert.deepEqual(await values(page), ['单独甲', '单独乙']);
+  await run(page, 'undo'); assert.deepEqual(await values(page), ['甲', '乙']);
+  await ctl(page, 'close').click();
+  await page.locator('#tfa-host-v1 .field-dice').nth(1).click(); await idle(page); assert.deepEqual(await values(page), ['甲', '单独乙']);
+  await settings(page);
+  await expand(page, 'templateDetails'); await ctl(page, 'save').click();
+  assert.match(await ctl(page, 'toastMessage').textContent(), /没有可可靠保存/);
+  const db = JSON.parse(env.store.get(DATABASE)); assert.deepEqual(db.templates, []); assert.deepEqual(db.rules['http://localhost/editor::editor'], {});
+  await page.reload(); await page.addScriptTag({ content: script }); await page.locator('#tfa-host-v1').waitFor();
+  assert.deepEqual(await page.locator('#tfa-host-v1 .field .mode').evaluateAll(nodes => nodes.map(node => node.value)), ['auto', 'auto']);
+});
+
+test('unlabelled duplicates can be refreshed normally without saved rules', async t => {
+  const env = await setup(t, { content: '<form id="editor"><div><input placeholder="备注" value="甲"></div><div><input placeholder="备注" value="乙"></div></form>' }), page = await env.openPage();
+  await reveal(page); await run(page); const filled = await values(page);
+  assert.notEqual(filled[0], '甲'); assert.notEqual(filled[1], '乙'); assert.notEqual(filled[0], filled[1]);
+  await run(page, 'toastUndo'); assert.deepEqual(await values(page), ['甲', '乙']);
+});
+
+test('nearby labels respect ARIA, exclude help text, and do not merge multiple controls', async t => {
+  const content = '<form id="editor"><div><div>本地标签</div><input name="explicit" aria-label="明确标签"></div><div><div>实际名称</div><span class="help-text">填写说明</span><div><input name="help"></div></div><div><div hidden>隐藏名称</div><input name="hidden" placeholder="备用名称"></div><div><div>共用行标题</div><input placeholder="同一提示"><input placeholder="同一提示"></div><div class="form-group"><div><div>甲字段</div><input></div><div><div>乙字段</div><input></div></div></form>';
+  const env = await setup(t, { content }), page = await env.openPage();
+  assert.deepEqual(await fieldNames(page), ['明确标签', '实际名称', '备用名称', '同一提示', '同一提示', '甲字段', '乙字段']);
+});
+
+test('custom section headings separate otherwise equal fields across template replay and DOM reorder', async t => {
+  const content = `<div id="editor"><div class="block-a"><div><h2>甲组</h2></div><div>${decimalField('金额', '10')}</div></div><div class="block-b"><div><h2>乙组</h2></div><div>${decimalField('金额', '20')}</div></div></div>`;
+  const env = await setup(t, { content }), page = await env.openPage(); await settings(page); await expand(page, 'templateDetails'); await ctl(page, 'save').click();
+  await page.waitForFunction(() => document.getElementById('tfa-host-v1').shadowRoot.getElementById('templateCount').textContent === '1 份');
+  await page.evaluate(() => { const root = document.getElementById('editor'); root.prepend(root.lastElementChild); });
+  await run(page); await ctl(page, 'overwrite').check(); await run(page, 'replay');
+  assert.equal(await page.locator('.block-a input').inputValue(), '10'); assert.equal(await page.locator('.block-b input').inputValue(), '20');
+});
+
+test('a unique legacy rule migrates while the original opaque entry remains intact', async t => {
+  const desc = oldDescriptor(), key = oldKey(desc), rule = { mode: 'fixed', value: '37.25' };
+  assert.equal(key, 'xom12e');
+  const env = await setup(t, { content: economicForm(['工业总产值（亿元）']), store: oldDatabase({ [key]: rule }) }), page = await env.openPage();
+  await reveal(page); await run(page); assert.deepEqual(await values(page), ['37.25']);
+  const rules = JSON.parse(env.store.get(DATABASE)).rules['http://localhost/editor::body'];
+  assert.deepEqual(rules[key], rule);
+  assert(Object.values(rules).some(rule => rule.descriptor?.label === '工业总产值（亿元）' && rule.value === '37.25'));
+  await settings(page); await expand(page, 'fieldDetails'); await row(page, '工业总产值（亿元）').locator('.mode').selectOption('auto');
+  await run(page); assert.notEqual((await values(page))[0], '37.25');
+  await page.reload(); await page.addScriptTag({ content: script }); await page.locator('#tfa-host-v1').waitFor();
+  assert.equal(await page.locator('#tfa-host-v1 .field .mode').inputValue(), 'auto');
+});
+
+test('a colliding legacy rule is preserved and reported without applying it to either new field', async t => {
+  const key = oldKey(oldDescriptor()), legacy = { mode: 'fixed', value: '999' };
+  const env = await setup(t, { content: economicForm(), store: oldDatabase({ [key]: legacy }) }), page = await env.openPage();
+  await settings(page); await expand(page, 'fieldDetails');
+  assert.match(await ctl(page, 'ruleHint').textContent(), /1 条已有规则/);
+  assert.deepEqual(await page.locator('#tfa-host-v1 .field .mode').evaluateAll(nodes => nodes.map(node => node.value)), ['auto', 'auto']);
+  const before = await values(page); await run(page); assert.deepEqual(await values(page), before);
+  assert.deepEqual(JSON.parse(env.store.get(DATABASE)).rules['http://localhost/editor::body'][key], legacy);
+  await row(page, '工业增加值（亿元）').locator('.mode').selectOption('fixed'); await row(page, '工业增加值（亿元）').locator('.fixed').fill('202');
+  await run(page); assert.equal((await values(page))[1], '202'); assert.notEqual((await values(page))[0], '202');
+});
+
+test('unmatched opaque legacy rules are retained with a visible compatibility notice', async t => {
+  const old = { mode: 'skip', value: '' };
+  const env = await setup(t, { content: economicForm(), store: oldDatabase({ obsoleteHash: old }) }), page = await env.openPage();
+  await settings(page); await expand(page, 'fieldDetails'); assert(await ctl(page, 'ruleHint').isVisible());
+  await run(page); assert.deepEqual(JSON.parse(env.store.get(DATABASE)).rules['http://localhost/editor::body'].obsoleteHash, old);
+});
+
+test('legacy templates still match a unique placeholder through the original descriptor', async t => {
+  const template = oldTemplate([oldDescriptor()], ['72.5']);
+  const env = await setup(t, { content: economicForm(['工业总产值（亿元）']), store: oldDatabase({}, [template]) }), page = await env.openPage();
+  await settings(page); await expand(page, 'templateDetails'); await ctl(page, 'overwrite').check(); await run(page, 'replay');
+  assert.deepEqual(await values(page), ['72.5']);
+  assert.equal(await page.evaluate(() => window.submitted), false);
+});
+
+test('ambiguous legacy templates never assign values by DOM order', async t => {
+  const template = oldTemplate([oldDescriptor(), oldDescriptor()], ['123', '456']);
+  const env = await setup(t, { content: economicForm(), store: oldDatabase({}, [template]) }), page = await env.openPage(); const before = await values(page);
+  await settings(page); await expand(page, 'templateDetails'); await ctl(page, 'overwrite').check(); await run(page, 'replay');
+  assert.deepEqual(await values(page), before); assert.match(await ctl(page, 'results').textContent(), /存在多个同名字段/);
+  assert.deepEqual(JSON.parse(env.store.get(DATABASE)).templates, [template]);
+});
+
+test('generated React IDs are excluded from new identities while legacy rules migrate before IDs change', async t => {
+  const desc = oldDescriptor({ kind: 'text', type: 'text', id: '«r1r»', label: '原提示', placeholder: '原提示' });
+  const content = '<form id="editor"><div><div>业务名称</div><input id="«r1r»" placeholder="原提示" value="原值"></div></form>';
+  const env = await setup(t, { content, store: oldDatabase({ [oldKey(desc)]: { mode: 'fixed', value: '兼容固定值' } }, [], 'editor') }), page = await env.openPage();
+  await reveal(page); await run(page); assert.deepEqual(await values(page), ['兼容固定值']);
+  const rules = JSON.parse(env.store.get(DATABASE)).rules['http://localhost/editor::editor'];
+  const modern = Object.values(rules).find(rule => rule.descriptor); assert.equal(modern.descriptor.id, ''); assert.equal(modern.descriptor.label, '业务名称');
+  await settings(page); await expand(page, 'templateDetails'); await ctl(page, 'save').click();
+  await page.waitForFunction(() => document.getElementById('tfa-host-v1').shadowRoot.getElementById('templateCount').textContent === '1 份');
+  await page.evaluate(() => { const field = document.querySelector('#editor input'); field.id = '«r9z»'; field.value = '重绘原值'; });
+  await run(page); assert.deepEqual(await values(page), ['兼容固定值']);
+  await page.locator('#editor input').fill('其他值'); await ctl(page, 'overwrite').check(); await run(page, 'replay'); assert.deepEqual(await values(page), ['兼容固定值']);
+});
+
+test('unique replacement nodes keep pending fills and undo mapped to the correct business label', async t => {
+  const env = await setup(t, { content: economicForm() }), page = await env.openPage(); const original = await values(page);
+  await page.evaluate(() => {
+    const [first, second] = document.querySelectorAll('#editor input');
+    first.addEventListener('input', () => second.replaceWith(second.cloneNode(true)), { once: true });
+  });
+  await reveal(page); await run(page); const filled = await values(page);
+  assert(filled.every((value, i) => value !== original[i]));
+  await page.evaluate(() => document.querySelectorAll('#editor input').forEach(node => { const copy = node.cloneNode(true); copy.value = node.value; node.replaceWith(copy); }));
+  await run(page, 'toastUndo'); assert.deepEqual(await values(page), original);
+});
+
+test('ambiguous replacement nodes are skipped and never treated as newly added fields', async t => {
+  const content = '<form id="editor"><div><input placeholder="同名" value="甲"></div><div><input placeholder="同名" value="乙"></div></form>';
+  const env = await setup(t, { content }), page = await env.openPage();
+  await page.evaluate(() => {
+    const [first, second] = document.querySelectorAll('#editor input');
+    first.addEventListener('input', () => second.replaceWith(second.cloneNode(true)), { once: true });
+  });
+  await reveal(page); await run(page); const filled = await values(page);
+  assert.notEqual(filled[0], '甲'); assert.equal(filled[1], '乙');
+  assert.match(await ctl(page, 'results').textContent(), /原同名控件已被替换/);
+  await run(page, 'toastUndo'); assert.deepEqual(await values(page), ['甲', '乙']);
+});
+
+test('undo does not transfer a removed duplicate snapshot to the surviving field', async t => {
+  const content = '<form id="editor"><div><input placeholder="同名" value="甲"></div><div><input placeholder="同名" value="乙"></div></form>';
+  const env = await setup(t, { content }), page = await env.openPage(); await reveal(page); await run(page);
+  await page.evaluate(() => document.querySelectorAll('#editor input')[1].remove());
+  await run(page, 'toastUndo'); assert.deepEqual(await values(page), ['甲']);
+});
+
+test('a reused DOM node with a changed business label is not written after asynchronous generation', { timeout: 20000 }, async t => {
+  const content = '<form id="editor"><div><div class="caption">原业务字段</div><input value="原文"></div></form>';
+  const env = await setup(t, { content }), page = await env.openPage(); await settings(page);
+  await ctl(page, 'textSettings').locator('.text-mode').selectOption('online');
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; }), request = new Promise(resolve => { started = resolve; });
+  t.after(() => release());
+  await page.route('https://v1.hitokoto.cn/**', async route => { started(); await gate; await route.fulfill({ contentType: 'application/json', headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify({ hitokoto: '在线文案' }) }).catch(() => {}); });
+  await ctl(page, 'quickFill').click(); await request;
+  await page.evaluate(() => { document.querySelector('.caption').textContent = '另一个业务字段'; }); release(); await idle(page);
+  assert.deepEqual(await values(page), ['原文']); assert.match(await ctl(page, 'results').textContent(), /标签或用途已变化/);
+});
+
+test('legacy generated form IDs retain rules and generation preferences when moving to a stable scope', async t => {
+  const desc = oldDescriptor({ kind: 'text', type: 'text', name: 'title', label: '标题', placeholder: '' });
+  const store = oldDatabase({ [oldKey(desc)]: { mode: 'fixed', value: '旧规则' } }, [], '«r2a»');
+  const db = JSON.parse(store[DATABASE]); db.settings['http://localhost/editor::«r2a»'] = { text: { mode: 'auto', minLength: '7', maxLength: '7' } }; store[DATABASE] = JSON.stringify(db);
+  const content = '<div id="editor"><form id="«r2a»"><label>标题<input name="title" value="原文"></label><label>说明<input name="notes" value="原说明"></label></form></div>';
+  const env = await setup(t, { content, store }), page = await env.openPage(); await reveal(page); await run(page);
+  assert.equal(await input(page, 'title').inputValue(), '旧规则'); assert.equal((await input(page, 'notes').inputValue()).length, 7);
+  const saved = JSON.parse(env.store.get(DATABASE));
+  assert.deepEqual(saved.rules['http://localhost/editor::«r2a»'], db.rules['http://localhost/editor::«r2a»']);
+  assert(saved.rules['http://localhost/editor::FORM']); assert.equal(saved.settings['http://localhost/editor::FORM'].text.minLength, '7');
+});
+
+test('custom radio group captions improve without changing legacy template option text', async t => {
+  const desc = oldDescriptor({ kind: 'radio', type: 'radio', name: 'choice', label: 'choice', placeholder: '' });
+  const template = oldTemplate([desc], [{ value: 'b', text: 'choice' }]);
+  const content = '<form id="editor"><div><div>选择类型</div><div role="radiogroup"><input type="radio" name="choice" value="a" checked><input type="radio" name="choice" value="b"></div></div></form>';
+  const env = await setup(t, { content, store: oldDatabase({}, [template], 'editor') }), page = await env.openPage();
+  assert.deepEqual(await fieldNames(page), ['选择类型']);
+  await settings(page); await expand(page, 'templateDetails'); await ctl(page, 'overwrite').check(); await run(page, 'replay');
+  assert.equal(await page.locator('[name=choice][value=b]').isChecked(), true);
+  assert.match(await ctl(page, 'stats').textContent(), /成功 1/);
+  await run(page, 'undo'); assert.equal(await page.locator('[name=choice][value=a]').isChecked(), true);
+});
+
+test('Ant Design and Element Plus wrapper inputs count as one control for custom labels', async t => {
+  const content = '<div id="editor"><div><h2>核算范围</h2></div><div><div><div>核算类型</div><div class="ant-select"><div class="ant-select-content"><span>归档</span><input role="combobox" type="search" id="«r1r»" readonly></div></div></div><div><div>周期类型</div><div class="el-select"><input role="combobox" readonly id="el-id-234"></div></div><div><div>年份</div><div class="ant-picker"><div class="ant-picker-input"><input readonly placeholder="请选择年份"></div></div></div></div></div>';
+  const env = await setup(t, { content, store: { [INLINE]: true } }), page = await env.openPage();
+  assert.deepEqual(await fieldNames(page), ['核算类型', '周期类型', '年份']);
+  await page.locator('#tfa-host-v1 .field-dice').first().waitFor(); assert.equal(await page.locator('#tfa-host-v1 .field-dice').count(), 2);
+  assert.match(await row(page, '年份').locator('.reason').first().textContent(), /需手动处理/);
+});
+
+test('a completely anonymous single control fills and keeps its rule local instead of saving an unusable template', async t => {
+  const env = await setup(t, { content: '<form id="editor"><div><input value="原文"></div></form>' }), page = await env.openPage();
+  await settings(page); await expand(page, 'fieldDetails');
+  const field = page.locator('#tfa-host-v1 .field');
+  assert.match(await field.locator('.rule-warning').textContent(), /仅当前控件/);
+  await field.locator('.mode').selectOption('fixed'); await field.locator('.fixed').fill('临时固定值');
+  await run(page); assert.deepEqual(await values(page), ['临时固定值']);
+  await run(page, 'undo'); assert.deepEqual(await values(page), ['原文']);
+  await expand(page, 'templateDetails'); await ctl(page, 'save').click();
+  assert.match(await ctl(page, 'toastMessage').textContent(), /没有可可靠保存/);
+  const db = JSON.parse(env.store.get(DATABASE)); assert.deepEqual(db.rules['http://localhost/editor::editor'], {}); assert.deepEqual(db.templates, []);
+});

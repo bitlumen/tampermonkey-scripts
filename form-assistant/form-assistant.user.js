@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         系统测试填表助手
 // @namespace    https://github.com/bitlumen
-// @version      1.1.0
+// @version      1.2.0
 // @description  三段快捷条：整表重填、填表设置、全局单项随机；支持模板、文本库与生成偏好。本地及局域网默认显示。
 // @author       enthem
 // @match        http://*/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
   if (document.getElementById('tfa-host-v1')) return;
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const STORAGE = 'tfa.database.v1';
   const SITE_STORAGE = 'tfa.site-visibility.v1';
   const LIBRARY_STORAGE = 'tfa.text-library.v1';
@@ -45,6 +45,9 @@
   let db = { schema: 1, templates: [], rules: {}, settings: {} };
   let siteModes = {};
   let fields = [], busy = false, cancelled = false, opened = false, reports = [], history = [];
+  const nodeIds = new WeakMap(), sessionRules = new WeakMap();
+  const emptyRules = Object.freeze({});
+  let nextNodeId = 0, sessionRuleRevision = 0;
   let historyPage = '', historyRoot = null;
   let lastURL = location.href, lastPageKey = '', structureDirty = false, scopeDirty = true, activeRoot = null;
   const emptyRoot = document.createElement('div');
@@ -182,7 +185,8 @@
   function disabled(el) {
     return !!(el.disabled || el.matches(':disabled') || el.closest('[aria-disabled="true"],.is-disabled,.ant-select-disabled,.ant-picker-disabled,.ant-switch-disabled'));
   }
-  function dynamicId(id) { return !id || /^(el-id-|el-\d|rc[_-]|:r|headlessui-|radix-)|\d{8,}|[a-f0-9]{16,}/i.test(id); }
+  function legacyDynamicId(id) { return !id || /^(el-id-|el-\d|rc[_-]|:r|headlessui-|radix-)|\d{8,}|[a-f0-9]{16,}/i.test(id); }
+  function dynamicId(id) { return legacyDynamicId(id) || /^«[rR][\w:-]*»$/.test(id); }
   function labelText(label) {
     const copy = label.cloneNode(true);
     for (const node of qa('input,select,textarea,button,svg,[aria-hidden="true"],.el-select,.ant-select', copy)) node.remove();
@@ -194,10 +198,33 @@
     return { origin: location.origin, path: path + (route ? '#' + route[1] : ''), title: document.title };
   }
   function pageKey() { const p = pageInfo(); return p.origin + p.path; }
-  function labelFor(el) {
+  function controlOwner(el) {
+    return el.closest(UNSUPPORTED) || el.closest('.el-select,.ant-select,.ant-input-number,.el-input-number,[role="radiogroup"],.el-radio-group,.ant-radio-group') ||
+      el.closest('[role="combobox"],[role="switch"]') || el;
+  }
+  function localFieldLabel(el) {
+    const owner = controlOwner(el);
+    // Stop at the first multi-control container; never merge labels across a row.
+    for (let branch = owner, parent = owner.parentElement, depth = 0; parent && depth < 6; branch = parent, parent = parent.parentElement, depth++) {
+      if (parent.matches(`${FORM},${OVERLAY},main,body,html`)) break;
+      const controls = new Set(qa(CONTROL, parent).filter(fieldVisible).map(controlOwner));
+      if (controls.size !== 1 || !controls.has(owner)) break;
+      const candidates = arr(parent.children).filter(node => node !== branch && visible(node) &&
+        !node.matches('button,a,[role="alert"],[role="status"],h1,h2,h3,h4') && !q(`${CONTROL},button,a`, node) &&
+        !/error|feedback|hint|help|description|tooltip/i.test(node.className) &&
+        (node.compareDocumentPosition(branch) & Node.DOCUMENT_POSITION_FOLLOWING));
+      const labels = candidates.map(node => ({ node, text: labelText(node) })).filter(item => item.text && item.text.length <= 100);
+      const explicit = labels.filter(({ node }) => node.matches('label,[data-label]') || /label/i.test(node.className));
+      if (explicit.length === 1) return explicit[0].text;
+      if (labels.length === 1) return labels[0].text;
+      if (labels.length > 1) return '';
+    }
+    return '';
+  }
+  function labelFor(el, legacy = false) {
     const inp = el.matches('input,select,textarea') ? el : q('input,select,textarea', el);
     const labels = inp?.labels;
-    if (labels?.length) return clean(arr(labels).map(labelText).join(' '));
+    if (labels?.length) { const text = clean(arr(labels).map(labelText).join(' ')); if (text || legacy) return text; }
     const labelled = (el.getAttribute('aria-labelledby') || inp?.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
     if (labelled.length) {
       const text = labelled.map(id => document.getElementById(id)?.textContent || '').join(' ');
@@ -207,16 +234,19 @@
     if (aria) return clean(aria);
     const wrap = el.closest(WRAP);
     const label = wrap && q('.el-form-item__label,.ant-form-item-label,label,[data-label]', wrap);
-    if (label) return labelText(label);
+    if (label && (legacy || new Set(qa(CONTROL, wrap).filter(fieldVisible).map(controlOwner)).size === 1)) {
+      const text = labelText(label); if (text || legacy) return text;
+    }
     const cell = el.closest('td');
     const table = cell?.closest('table');
     if (table) {
       const header = table.querySelectorAll('thead tr:last-child th')[cell.cellIndex];
       if (header) return clean(header.textContent);
     }
-    return clean(el.getAttribute('placeholder') || inp?.getAttribute('placeholder') || el.getAttribute('name') || inp?.name || (!dynamicId(el.id) ? el.id : ''));
+    if (!legacy) { const nearby = localFieldLabel(el); if (nearby) return nearby; }
+    return clean(el.getAttribute('placeholder') || inp?.getAttribute('placeholder') || el.getAttribute('name') || inp?.name || (!(legacy ? legacyDynamicId : dynamicId)(el.id) ? el.id : ''));
   }
-  function contextFor(el) {
+  function contextFor(el, legacy = false) {
     const parts = [];
     const fs = el.closest('fieldset');
     if (fs) parts.push(clean(q('legend', fs)?.textContent));
@@ -228,18 +258,35 @@
       const heading = q('th[scope="row"],th', row) || arr(row.cells || []).find(c => !q(CONTROL, c) && norm(c.textContent));
       parts.push(rowKey ? `行:${rowKey}` : clean(heading?.textContent));
     }
-    return parts.filter(Boolean).join(' / ');
+    const context = parts.filter(Boolean).join(' / ');
+    if (context || legacy) return context;
+    // Custom layouts often place a heading wrapper immediately before its body.
+    for (let node = el.parentElement, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+      if (node.matches(`${FORM},${OVERLAY},main,body,html`)) break;
+      for (let prev = node.previousElementSibling, count = 0; prev && count < 3; prev = prev.previousElementSibling, count++) {
+        if (q(CONTROL, prev) || prev.matches(CONTROL)) break;
+        const headings = prev.matches('h1,h2,h3,h4,[role="heading"]') ? [prev] : qa('h1,h2,h3,h4,[role="heading"]', prev);
+        const shown = headings.filter(visible);
+        if (shown.length === 1) return clean(shown[0].textContent).slice(0, 120);
+        if (shown.length > 1) break;
+      }
+    }
+    return '';
   }
-  function descriptor(f) {
+  function descriptor(f, legacy = false) {
     const input = f.el.matches('input,select,textarea') ? f.el : q('input,select,textarea', f.el);
+    const unstable = legacy ? legacyDynamicId : dynamicId;
     return {
       kind: f.kind, type: f.type || '', name: f.el.getAttribute('name') || input?.name || '',
-      id: !dynamicId(f.el.id) ? f.el.id : (!dynamicId(input?.id) ? input.id : ''),
+      id: !unstable(f.el.id) ? f.el.id : (!unstable(input?.id) ? input.id : ''),
       testid: f.el.getAttribute('data-testid') || f.el.getAttribute('data-test') || input?.getAttribute('data-testid') || '',
-      label: f.label, context: f.context, placeholder: input?.getAttribute('placeholder') || ''
+      label: legacy ? f.legacyLabel : f.label, context: legacy ? contextFor(f.el, true) : f.context, placeholder: input?.getAttribute('placeholder') || ''
     };
   }
   function identity(f) { return hash(JSON.stringify(f.desc)); }
+  function liveReference(f) { return { descriptor: f.desc, element: f.el, unique: f.unique }; }
+  // Group captions may improve, but saved radio option text keeps its original meaning.
+  function radioOptionLabel(el) { return labelFor(el, true) || clean(el.textContent); }
   function sensitive(f) {
     const s = [f.label, f.desc.name, f.type, f.desc.placeholder, f.el.getAttribute('autocomplete')].join(' ');
     return /password|密码|验证码|一次性口令|otp\b|one-time-code|csrf|access.?token|secret|api.?key|信用卡|银行卡|身份证|passport|social.?security|同意.*(协议|条款)|隐私.*(协议|政策)/i.test(s);
@@ -300,7 +347,7 @@
       if (seen.has(el) || !fieldVisible(el) || searchField(el, kind)) continue;
       if (el.matches('[role="checkbox"],[role="radio"]') && q('input[type="checkbox"],input[type="radio"]', el)) continue;
       seen.add(el);
-      const f = { el, kind, type, label: labelFor(el), context: contextFor(el), required: !!(el.required || el.getAttribute('aria-required') === 'true' || el.closest('.is-required,.ant-form-item-required')) };
+      const f = { el, kind, type, label: labelFor(el), legacyLabel: labelFor(el, true), context: contextFor(el), required: !!(el.required || el.getAttribute('aria-required') === 'true' || el.closest('.is-required,.ant-form-item-required')) };
       if (kind === 'radio') {
         const groupRoot = el.closest('[role="radiogroup"],fieldset,.el-radio-group,.ant-radio-group') || el.form || root;
         const name = el.name || groupRoot.getAttribute('aria-label') || 'unnamed';
@@ -309,15 +356,26 @@
         if (groups.has(name)) { groups.get(name).members.push(el); continue; }
         f.members = [el];
         const groupLabel = clean(q('legend', groupRoot)?.textContent || groupRoot.getAttribute('aria-label'));
-        f.label = groupLabel || clean(q('.el-form-item__label,.ant-form-item-label', el.closest(WRAP) || el)?.textContent) || el.name || f.label;
+        f.label = groupLabel || clean(q('.el-form-item__label,.ant-form-item-label', el.closest(WRAP) || el)?.textContent) ||
+          (groupRoot.matches('[role="radiogroup"],.el-radio-group,.ant-radio-group') ? localFieldLabel(groupRoot) : '') || el.name || f.label;
+        f.legacyLabel = groupLabel || clean(q('.el-form-item__label,.ant-form-item-label', el.closest(WRAP) || el)?.textContent) || el.name || f.legacyLabel;
         groups.set(name, f);
       }
       f.desc = descriptor(f); f.key = identity(f);
+      f.legacyDesc = descriptor(f, true); f.legacyKey = hash(JSON.stringify(f.legacyDesc));
+      if (!nodeIds.has(el)) nodeIds.set(el, `field-${++nextNodeId}`);
+      f.uid = nodeIds.get(el);
       f.reason = sensitive(f) ? '敏感或认证字段，跳过' : disabled(el) ? '控件已禁用' : (el.readOnly && kind !== 'combo') ? '字段只读' : kind === 'rich' ? '富文本编辑器需单独适配' : kind === 'unsupported' ? '文件/日期组件/级联控件需手动处理' : '';
       if (!f.label) f.label = `未命名${TYPES[kind] || '字段'}`;
       result.push(f);
     }
-    return result.slice(0, 500);
+    const limited = result.slice(0, 500), counts = new Map();
+    for (const f of limited) counts.set(f.key, (counts.get(f.key) || 0) + 1);
+    for (const f of limited) {
+      f.peers = limited;
+      f.unique = counts.get(f.key) === 1 && matchField(f.desc, limited).field === f;
+    }
+    return limited;
   }
 
   function discoverScopes() {
@@ -363,10 +421,10 @@
     if (scopeDirty || !activeRoot || (activeRoot !== emptyRoot && !activeRoot.isConnected)) discoverScopes();
     return activeRoot;
   }
-  function scopeKey() {
+  function scopeKey(legacy = false) {
     const root = rootScope();
     if (root === emptyRoot) return 'empty';
-    return root === document.body || (!root.matches(FORM) && !root.matches(OVERLAY)) ? 'body' : norm(root.getAttribute('name') || root.getAttribute('aria-label') || (!dynamicId(root.id) ? root.id : '') || root.tagName);
+    return root === document.body || (!root.matches(FORM) && !root.matches(OVERLAY)) ? 'body' : norm(root.getAttribute('name') || root.getAttribute('aria-label') || (!(legacy ? legacyDynamicId : dynamicId)(root.id) ? root.id : '') || root.tagName);
   }
   function ruleKey() { return `${pageKey()}::${scopeKey()}`; }
   function templateBaseName() {
@@ -398,16 +456,54 @@
     while (used.has(name)) name = `${base}（${index++}）`;
     ui.templateName.value = name; templateNameAuto = true;
   }
-  function currentRules() { return db.rules[ruleKey()] || {}; }
-  function ruleFor(f) { return currentRules()[f.key] || { mode: 'auto', value: '' }; }
+  function currentRules() { return db.rules[ruleKey()] || db.rules[`${pageKey()}::${scopeKey(true)}`] || emptyRules; }
+  function bindRules(list) {
+    const rules = currentRules();
+    if (list.ruleSource === rules && list.sessionRevision === sessionRuleRevision) return;
+    list.ruleSource = rules; list.sessionRevision = sessionRuleRevision;
+    const aliases = new Map(), unresolved = new Set();
+    for (const f of list) {
+      f.ruleOptions = []; f.ruleWarning = ''; f.ruleBlocked = '';
+      for (const key of new Set([f.key, f.legacyKey])) {
+        if (!aliases.has(key)) aliases.set(key, []);
+        aliases.get(key).push(f);
+      }
+    }
+    for (const [key, rule] of Object.entries(rules)) {
+      const matched = rule.descriptor && matchField(rule.descriptor, list).field;
+      const owners = matched ? [matched] : aliases.get(key) || [];
+      if (owners.length === 1 && owners[0].unique && (!rule.descriptor || matched)) {
+        const f = owners[0], priority = rule.descriptor ? (key === f.key ? 3 : 2) : 1;
+        f.ruleOptions.push({ key, rule, priority });
+      } else {
+        unresolved.add(key);
+        for (const f of owners) f.ruleBlocked = f.ruleWarning = '旧规则无法唯一对应，已保留原数据；请为此项重新指定规则';
+      }
+    }
+    for (const f of list) {
+      const sorted = f.ruleOptions.sort((a, b) => b.priority - a.priority), first = sorted[0];
+      if (first && sorted[1]?.priority === first.priority && !same(first.rule, sorted[1].rule)) {
+        f.ruleBlocked = f.ruleWarning = '存在多份可匹配的规则，已保留原数据；请为此项重新指定规则';
+        sorted.forEach(option => unresolved.add(option.key)); f.boundRule = { mode: 'auto', value: '' };
+      } else {
+        f.boundRule = first?.rule || { mode: 'auto', value: '' };
+        if (first) f.ruleBlocked = f.ruleWarning = '';
+      }
+      const local = sessionRules.get(f.el);
+      if (local?.scope === ruleKey() && local.key === f.key) { f.boundRule = local.rule; f.ruleBlocked = f.ruleWarning = ''; }
+      if (!f.unique) f.ruleWarning = [f.ruleWarning, '缺少可区分的长期标识；单项规则仅当前控件有效，不保存到模板'].filter(Boolean).join('；');
+    }
+    list.unresolvedRules = unresolved.size;
+  }
+  function ruleFor(f) { bindRules(f.peers); return f.boundRule; }
   function currentSettings() {
-    const saved = db.settings[ruleKey()] || {}, defaults = defaultSettings();
+    const saved = db.settings[ruleKey()] || db.settings[`${pageKey()}::${scopeKey(true)}`] || {}, defaults = defaultSettings();
     return { number: { ...defaults.number, ...saved.number }, text: { ...defaults.text, ...saved.text } };
   }
   function read(f) {
     if (f.kind === 'radio') {
       const selected = f.members.find(e => e.checked || e.getAttribute('aria-checked') === 'true');
-      return selected ? { value: selected.value ?? selected.getAttribute('data-value') ?? '', text: labelFor(selected) || clean(selected.textContent) } : null;
+      return selected ? { value: selected.value ?? selected.getAttribute('data-value') ?? '', text: radioOptionLabel(selected) } : null;
     }
     if (f.kind === 'checkbox' || f.kind === 'switch') return f.el.matches('input') ? f.el.checked : f.el.getAttribute('aria-checked') === 'true' || f.el.classList.contains('is-checked') || f.el.classList.contains('ant-switch-checked');
     if (f.kind === 'select') return arr(f.el.selectedOptions).filter(o => o.value !== '' && !o.disabled).map(o => ({ value: o.value, text: clean(o.textContent) }));
@@ -440,20 +536,36 @@
   }
   function compatible(a, b) { return a.kind === b.kind && (!(a.kind === 'text' || a.kind === 'date') || a.type === b.type); }
   function matchField(desc, candidates) {
-    const scored = candidates.filter(f => compatible(desc, f.desc)).map(f => {
+    const scoreFor = target => {
       let score = 0;
-      if (desc.testid && desc.testid === f.desc.testid) score += 100;
-      if (desc.name && desc.name === f.desc.name) score += 70;
-      if (desc.id && desc.id === f.desc.id) score += 80;
-      if (desc.label && desc.label === f.desc.label) score += 45;
-      if (desc.context && desc.context === f.desc.context) score += 35;
-      if (desc.placeholder && desc.placeholder === f.desc.placeholder) score += 12;
-      if (desc.context && f.desc.context && desc.context !== f.desc.context) score -= 80;
-      return { f, score };
+      if (desc.testid && target.testid && desc.testid !== target.testid) return 0;
+      if (desc.name && target.name && desc.name !== target.name) return 0;
+      if (!dynamicId(desc.id) && !dynamicId(target.id) && desc.id !== target.id) return 0;
+      if (desc.testid && desc.testid === target.testid) score += 100;
+      if (desc.name && desc.name === target.name) score += 70;
+      if (!dynamicId(desc.id) && desc.id === target.id) score += 80;
+      if (desc.label && desc.label === target.label) score += 45;
+      if (desc.context && desc.context === target.context) score += 35;
+      if (desc.placeholder && desc.placeholder === target.placeholder) score += 12;
+      if (desc.context && target.context && desc.context !== target.context) score -= 80;
+      return score;
+    };
+    const scored = candidates.filter(f => compatible(desc, f.desc)).map(f => {
+      const conflict = desc.context && f.desc.context && desc.context !== f.desc.context && desc.context !== f.legacyDesc.context;
+      return { f, score: conflict ? 0 : Math.max(scoreFor(f.desc), scoreFor(f.legacyDesc)) };
     }).sort((a, b) => b.score - a.score);
     if (!scored.length || scored[0].score < 40) return { reason: '未找到可靠匹配字段' };
     if (scored[1]?.score === scored[0].score) return { reason: '存在多个同名字段，需增加标签或分组标识' };
     return { field: scored[0].f };
+  }
+  function matchLive(reference, candidates) {
+    if (!reference.element) return matchField(reference.descriptor, candidates);
+    const direct = candidates.find(f => f.el === reference.element);
+    if (direct) return same(direct.desc, reference.descriptor) ? { field: direct } : { reason: '控件标签或用途已变化，未继续填写' };
+    if (reference.element.isConnected) return { reason: '原控件已隐藏或移出当前填写范围' };
+    if (!reference.unique) return { reason: '原同名控件已被替换，无法确认对应关系' };
+    // A replacement node is safe only when its saved features identify one field.
+    return matchField(reference.descriptor, candidates);
   }
 
   function rng(seed) {
@@ -709,7 +821,7 @@
     return result;
   }
   async function generate(f, seed) {
-    const random = rng(`${seed}:${f.key}`);
+    const random = rng(`${seed}:${f.key}${f.unique ? '' : ':' + f.uid}`);
     const rule = ruleFor(f), settings = currentSettings();
     if (rule.mode === 'number') return generatedNumber(f, random, { ...settings.number, ...rule.number });
     if (f.kind === 'number') return generatedNumber(f, random);
@@ -719,7 +831,7 @@
       const opts = f.members.filter(e => !disabled(e));
       if (!opts.length) throw new Error('没有可选项');
       const e = opts[Math.floor(random() * opts.length)];
-      return { value: e.value ?? e.getAttribute('data-value') ?? '', text: labelFor(e) || clean(e.textContent) };
+      return { value: e.value ?? e.getAttribute('data-value') ?? '', text: radioOptionLabel(e) };
     }
     if (f.kind === 'select') {
       const opts = arr(f.el.options).filter(o => o.value !== '' && !o.disabled && !o.parentElement.disabled);
@@ -844,8 +956,8 @@
         for (const el of f.members.filter(e => e.checked)) { setNative(el, 'checked', false); dispatchValue(el); }
         return;
       }
-      const exact = f.members.filter(el => (el.value ?? el.getAttribute('data-value') ?? '') === value.value && (labelFor(el) || clean(el.textContent)) === value.text);
-      const opts = exact.length ? exact : f.members.filter(el => (labelFor(el) || clean(el.textContent)) === value.text);
+      const exact = f.members.filter(el => (el.value ?? el.getAttribute('data-value') ?? '') === value.value && radioOptionLabel(el) === value.text);
+      const opts = exact.length ? exact : f.members.filter(el => radioOptionLabel(el) === value.text);
       if (opts.length !== 1 || disabled(opts[0])) throw new Error('单选项缺失、禁用或不唯一');
       if (!opts[0].checked && opts[0].getAttribute('aria-checked') !== 'true') opts[0].click();
     } else if (f.kind === 'checkbox' || f.kind === 'switch') {
@@ -912,9 +1024,9 @@
       return { value: opts[0].value, text: clean(opts[0].textContent) };
     });
     if (f.kind === 'radio') {
-      const opts = f.members.filter(e => labelFor(e) === value || e.value === value);
+      const opts = f.members.filter(e => radioOptionLabel(e) === value || e.value === value);
       if (opts.length !== 1) throw new Error('固定单选值未找到或不唯一');
-      return { value: opts[0].value ?? '', text: labelFor(opts[0]) };
+      return { value: opts[0].value ?? '', text: radioOptionLabel(opts[0]) };
     }
     return value.replace(/\{date\}/g, new Date().toLocaleDateString('sv-SE')).replace(/\{seed\}/g, ui.seed.value).replace(/\{timestamp\}/g, String(Date.now()));
   }
@@ -930,14 +1042,14 @@
       const template = db.templates.find(t => t.id === ui.templates.value);
       if (mode === 'template' && !template) return toast('请先选择模板');
       if (mode === 'template' && template.page.origin !== location.origin) return toast('模板属于其他网站，请在对应网站使用');
-      if (!fields.some(f => !f.reason && ruleFor(f).mode !== 'skip')) return toast('当前表单没有可填写项，搜索、禁用和跳过字段不参与');
+      if (!fields.some(f => !f.reason && ruleFor(f).mode !== 'skip' && !f.ruleBlocked)) return toast('当前表单没有可填写项；请检查跳过、禁用或无法对应的旧规则');
       reports = []; history = []; started = true;
       generationSession = { online: [], error: '' };
       historyPage = startPage; historyRoot = startRoot;
       // Quick refill uses a new batch seed without changing the reproducibility setting.
       const seed = mode === 'refresh' ? `${ui.seed.value || '1'}:${uid()}` : ui.seed.value || '1';
-      const entries = mode === 'template' ? template.fields : fields.map(f => ({ descriptor: f.desc }));
-      const done = new Set(), planned = new Set(entries.map(e => hash(JSON.stringify(e.descriptor))));
+      const entries = mode === 'template' ? template.fields : fields.map(liveReference);
+      const done = new Set(), planned = entries.slice();
       const pending = entries.map(entry => ({ entry }));
       const successes = [];
       // Bounded rescanning handles conditional fields and upstream option loading.
@@ -946,41 +1058,45 @@
         for (let i = 0; i < count && !cancelled; i++) {
           const task = pending.shift(), entry = task.entry;
           if (pageKey() !== startPage || !startRoot.isConnected || rootScope() !== startRoot) { cancelled = true; report('任务', 'skip', '页面或表单已变化，已停止'); break; }
-          const candidates = collect(startRoot), match = matchField(entry.descriptor, candidates);
+          const candidates = collect(startRoot), match = matchLive(entry, candidates);
           const label = entry.descriptor.label || entry.descriptor.name || '未命名字段';
           if (!match.field) {
             if (pass < 2) pending.push(task); else report(label, 'skip', match.reason);
             continue;
           }
           const f = match.field;
-          if (done.has(f.key)) { report(label, 'skip', '多个模板字段指向同一控件'); continue; }
+          if (done.has(f.uid)) { report(label, 'skip', '多个填写任务指向同一控件'); continue; }
+          if (mode !== 'template') entry.element = f.el;
           const rule = ruleFor(f);
           if (f.reason === '控件已禁用' && pass < 2) { pending.push(task); continue; }
-          if (f.reason || rule.mode === 'skip') { report(f.label, 'skip', f.reason || '规则设为跳过'); done.add(f.key); continue; }
+          if (f.reason || f.ruleBlocked || rule.mode === 'skip') { report(f.label, 'skip', f.reason || f.ruleBlocked || '规则设为跳过'); done.add(f.uid); continue; }
           const before = read(f);
-          if (!overwrite && !isEmpty(before)) { report(f.label, 'skip', '已有内容，保留'); done.add(f.key); continue; }
+          if (!overwrite && !isEmpty(before)) { report(f.label, 'skip', '已有内容，保留'); done.add(f.uid); continue; }
           try {
             const value = mode === 'template' ? entry.value : rule.mode === 'fixed' ? parseFixed(f, rule.value) : mode === 'refresh' ? await generateDifferent(f, before, seed) : await generate(f, seed);
             if (cancelled || pageKey() !== startPage || !f.el.isConnected || rootScope() !== startRoot) throw new Error('页面已变化或操作已停止，未写入');
+            if (!matchLive(liveReference(f), collect(startRoot)).field) throw new Error('生成期间控件标签或用途已变化，未写入');
             if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
             // Capture before touching the control, including attempts that partially fail.
-            const snapshot = { descriptor: f.desc, value: before, after: undefined };
+            const snapshot = { ...liveReference(f), value: before, after: undefined };
             history.push(snapshot);
             try { await write(f, value); }
             finally { snapshot.after = read(f); }
             const error = fieldError(f);
             report(f.label, error ? 'warn' : 'ok', error || '已填写并核对显示值', f.desc);
-            successes.push({ descriptor: f.desc, value: read(f), reportIndex: reports.length - 1 }); done.add(f.key);
+            successes.push({ ...liveReference(f), value: read(f), reportIndex: reports.length - 1 }); done.add(f.uid);
           } catch (err) {
             if (pass < 2 && /暂无可选项/.test(err.message)) pending.push(task);
-            else { report(f.label, 'fail', err.message, f.desc); done.add(f.key); }
+            else { report(f.label, 'fail', err.message, f.desc); done.add(f.uid); }
           }
         }
         if (pass < 2 && !cancelled) {
           await sleep(250);
           if (mode !== 'template' && pageKey() === startPage) {
-            for (const f of collect(startRoot)) if (!planned.has(f.key) && planned.size < 500) {
-              planned.add(f.key); pending.push({ entry: { descriptor: f.desc } });
+            for (const f of collect(startRoot)) if (planned.length < 500 && !planned.some(entry => entry.element === f.el)) {
+              const related = planned.filter(entry => same(entry.descriptor, f.desc));
+              if (related.length && (f.unique || related.some(entry => !entry.element?.isConnected))) continue;
+              const entry = liveReference(f); planned.push(entry); pending.push({ entry });
             }
           }
         }
@@ -989,7 +1105,7 @@
         await sleep(220);
         const latest = collect(startRoot);
         for (const result of successes) {
-          const f = matchField(result.descriptor, latest).field;
+          const f = matchLive(result, latest).field;
           const error = f ? fieldError(f) || (!same(read(f), result.value) ? '后续联动改变了此字段，请检查' : '') : '字段在联动后消失';
           if (error) Object.assign(reports[result.reportIndex], { status: 'warn', message: error });
         }
@@ -1012,25 +1128,26 @@
     for (let attempt = 0; attempt < 8 && !online && !cancelled && same(value, before); attempt++) value = await generate(f, `${seed}:${attempt}`);
     return value;
   }
-  async function randomizeOne(desc) {
+  async function randomizeOne(reference) {
     if (busy) return;
     busy = true; cancelled = false; setBusy(true); reports = [];
     generationSession = { online: [], error: '' };
-    let label = desc.label || '此字段';
+    let label = reference.descriptor.label || '此字段';
     try {
       await saveRuleEdits();
-      const root = rootScope(), page = pageKey(), match = matchField(desc, collect(root));
+      const root = rootScope(), page = pageKey(), match = matchLive(reference, collect(root));
       if (!match.field) throw new Error(match.reason);
       const f = match.field, rule = ruleFor(f); label = f.label;
-      if (f.reason || rule.mode === 'skip') throw new Error(f.reason || '字段规则为跳过');
+      if (f.reason || f.ruleBlocked || rule.mode === 'skip') throw new Error(f.reason || f.ruleBlocked || '字段规则为跳过');
       const before = read(f), seed = `${ui.seed.value}:${uid()}`;
       let value;
       if (rule.mode === 'fixed') value = parseFixed(f, rule.value);
       else value = await generateDifferent(f, before, seed);
       if (cancelled || pageKey() !== page || !root.isConnected || rootScope() !== root || !f.el.isConnected) throw new Error('页面已变化或操作已停止，未写入');
+      if (!matchLive(liveReference(f), collect(root)).field) throw new Error('生成期间控件标签或用途已变化，未写入');
       if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
       if (same(value, before)) { report(label, 'skip', '本次生成与原值相同，可调整规则或再次点击'); toast(`${label}：本次值相同，未改动`); return; }
-      const snapshot = { descriptor: f.desc, value: before, after: undefined };
+      const snapshot = { ...liveReference(f), value: before, after: undefined };
       history = [snapshot]; historyPage = page; historyRoot = root;
       try { await write(f, value); } finally { snapshot.after = read(f); }
       await sleep(160);
@@ -1048,7 +1165,7 @@
     try {
       for (const snapshot of snapshots) {
         if (cancelled || pageKey() !== historyPage || rootScope() !== historyRoot) break;
-        const match = matchField(snapshot.descriptor, collect(rootScope()));
+        const match = matchLive(snapshot, collect(rootScope()));
         if (!match.field) { report(snapshot.descriptor.label, 'skip', match.reason); continue; }
         const f = match.field;
         if (!same(read(f), snapshot.after)) { report(f.label, 'skip', '填写后被再次修改，保留当前值'); continue; }
@@ -1084,29 +1201,40 @@
   }
   async function saveRuleEdits() {
     if (!ui || renderedRuleKey !== ruleKey() || renderedRoot !== rootScope()) return;
-    const rules = { ...currentRules() };
+    const scope = ruleKey(), rules = { ...currentRules() }, localEdits = [];
     for (const row of qa('.field', ui.fields)) {
-      const key = row.dataset.key, mode = q('.mode', row).value, value = q('.fixed', row).value;
-      if (mode === 'auto') delete rules[key];
-      else rules[key] = { mode, value, ...(mode === 'number' ? { number: readNumberSettings(q('.numeric-config', row)) } : {}), ...(mode === 'text' ? { text: readTextSettings(q('.text-config', row)) } : {}) };
+      const f = fields.find(item => item.uid === row.dataset.key); if (!f) continue;
+      const mode = q('.mode', row).value, value = q('.fixed', row).value;
+      if (mode === 'auto' && !row.dataset.edited && ruleFor(f).mode === 'auto') continue;
+      const rule = { mode, value, ...(mode === 'number' ? { number: readNumberSettings(q('.numeric-config', row)) } : {}), ...(mode === 'text' ? { text: readTextSettings(q('.text-config', row)) } : {}) };
+      // Keep opaque legacy entries. An explicit auto rule overrides an older rule.
+      if (f.unique) rules[f.key] = { ...rule, descriptor: f.desc };
+      else localEdits.push({ f, rule });
     }
     const settings = { number: readNumberSettings(ui.numberSettings), text: readTextSettings(ui.textSettings) };
     if (ui.libraryText.value !== libraryText) await saveLibrary();
-    db.rules[ruleKey()] = rules;
-    db.settings[ruleKey()] = settings;
-    await persist();
+    const previousRules = db.rules[scope], previousSettings = db.settings[scope];
+    db.rules[scope] = rules; db.settings[scope] = settings;
+    try { await persist(); }
+    catch (error) { db.rules[scope] = previousRules; db.settings[scope] = previousSettings; throw error; }
+    for (const { f, rule } of localEdits) sessionRules.set(f.el, { scope, key: f.key, rule });
+    sessionRuleRevision++;
+    for (const row of qa('.field', ui.fields)) delete row.dataset.edited;
+    updateRuleHints();
   }
   async function saveTemplate() {
     await saveRuleEdits(); refreshFields(false);
     if (!ui.templateName.value.trim()) suggestTemplateName(true);
     const name = ui.templateName.value.trim();
-    const saved = fields.filter(f => !f.reason && ruleFor(f).mode !== 'skip').map(f => ({ descriptor: f.desc, value: read(f) }));
-    if (!saved.length) return toast('当前范围没有可保存的字段');
+    const eligible = fields.filter(f => !f.reason && ruleFor(f).mode !== 'skip' && !f.ruleBlocked);
+    const saved = eligible.filter(f => f.unique).map(f => ({ descriptor: f.desc, value: read(f) }));
+    const ambiguous = eligible.length - saved.length;
+    if (!saved.length) return toast('当前范围没有可可靠保存的字段；同名且无法区分的项不保存到模板');
     const matching = db.templates.find(t => t.name === name && t.page.origin === location.origin && t.page.path === pageInfo().path && t.scope === scopeKey());
     if (matching && !confirm(`覆盖当前页面的同名模板“${name}”？`)) return;
     const template = { id: matching?.id || uid(), name, page: pageInfo(), scope: scopeKey(), fields: saved, createdAt: matching?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
     db.templates = db.templates.filter(t => t.id !== template.id).concat(template);
-    await persist(); renderTemplates(template.id); suggestTemplateName(true); toast(`已保存“${name}”（${saved.length} 项）；已生成下一个默认名称`);
+    await persist(); renderTemplates(template.id); suggestTemplateName(true); toast(`已保存“${name}”（${saved.length} 项）${ambiguous ? `；${ambiguous} 个同名且无法区分的字段未保存` : '；已生成下一个默认名称'}`);
   }
   function validateTemplate(t) {
     const str = (s, max = 1000) => typeof s === 'string' && s.length <= max;
@@ -1216,9 +1344,8 @@
     if (!inlineEnabled || !siteEnabled()) { ui.inlineLayer.replaceChildren(); return; }
     if (rebuild) {
       discoverScopes();
-      const found = collect(rootScope()), counts = new Map();
-      for (const f of found) counts.set(f.key, (counts.get(f.key) || 0) + 1);
-      inlineFields = found.filter(f => !f.reason && ruleFor(f).mode !== 'skip' && counts.get(f.key) === 1);
+      const found = collect(rootScope());
+      inlineFields = found.filter(f => !f.reason && ruleFor(f).mode !== 'skip' && !f.ruleBlocked);
     }
     ui.inlineLayer.replaceChildren();
     const fragment = document.createDocumentFragment();
@@ -1246,17 +1373,17 @@
       const cx = Math.max(0, Math.min(innerWidth - 1, r.left + Math.min(r.width / 2, 8))), cy = Math.min(innerHeight - 1, r.top + Math.min(r.height / 2, 8));
       const top = document.elementFromPoint(cx, cy);
       if (top && top !== host && !anchor.contains(top) && !top.contains(anchor)) continue;
-      const button = document.createElement('button'); button.type = 'button'; button.className = 'field-dice'; button.dataset.key = f.key;
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'field-dice'; button.dataset.key = f.uid;
       button.textContent = '⚄'; button.title = `${f.label}：单独生成并覆盖此项；右键设置规则`;
       button.setAttribute('aria-label', `随机填写：${f.label}`); button.style.left = `${x}px`; button.style.top = `${y}px`; button.disabled = busy;
       fragment.append(button);
     }
     ui.inlineLayer.replaceChildren(fragment);
   }
-  function openFieldRule(desc) {
+  function openFieldRule(reference) {
     openPanel(); ui.fieldDetails.open = true;
-    const f = matchField(desc, fields).field;
-    const row = f && qa('.field', ui.fields).find(row => row.dataset.key === f.key);
+    const f = matchLive(reference, fields).field;
+    const row = f && qa('.field', ui.fields).find(row => row.dataset.key === f.uid);
     if (row) { row.scrollIntoView({ block: 'center' }); q('.mode', row).focus(); }
   }
 
@@ -1303,7 +1430,7 @@
             <button class="action tint full" id="saveSettings">保存生成偏好</button>
           </div></details>
 
-          <details class="section-card" id="fieldDetails"><summary><span class="section-icon teal" aria-hidden="true">☷</span><span class="summary-copy"><strong>单项设置</strong><small>为特定字段单独设置生成方式</small></span><span class="count-pill" id="fieldCount"></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="help">可以设置随机范围、文本库、固定值，或跳过某一项。右键字段旁的随机按钮可直接找到它。</div><div id="fields"></div><button class="action tint full" id="saveRules">保存单项设置</button><details class="inset-details"><summary>固定值怎么填写<span class="chevron" aria-hidden="true"></span></summary><div class="inset-body help">支持 {date}、{seed}、{timestamp}。下拉填写选项文字；多选用逗号分隔；开关填写 true / false。</div></details></div></details>
+          <details class="section-card" id="fieldDetails"><summary><span class="section-icon teal" aria-hidden="true">☷</span><span class="summary-copy"><strong>单项设置</strong><small>为特定字段单独设置生成方式</small></span><span class="count-pill" id="fieldCount"></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="help">可以设置随机范围、文本库、固定值，或跳过某一项。右键字段旁的随机按钮可直接找到它。</div><div class="reason" id="ruleHint" hidden></div><div id="fields"></div><button class="action tint full" id="saveRules">保存单项设置</button><details class="inset-details"><summary>固定值怎么填写<span class="chevron" aria-hidden="true"></span></summary><div class="inset-body help">支持 {date}、{seed}、{timestamp}。下拉填写选项文字；多选用逗号分隔；开关填写 true / false。</div></details></div></details>
           <details class="section-card" id="reportDetails"><summary><span class="section-icon blue" aria-hidden="true">✓</span><span class="summary-copy"><strong>填写记录</strong><small id="reportHint">查看本次填写结果</small></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="stats" id="stats"></div><div id="results"><div class="empty-state">开始填写后，结果会显示在这里。</div></div></div></details>
           <details class="section-card templates-card" id="templateDetails"><summary><span class="section-icon amber" aria-hidden="true">▤</span><span class="summary-copy"><strong>我的模板</strong><small>保存一套填写，下次直接复用</small></span><span class="count-pill" id="templateCount">0 份</span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body">
             <div id="emptyTemplates" class="empty-state" hidden>还没有模板。填好表单后，把这套内容保存下来吧。</div>
@@ -1331,7 +1458,7 @@
     on('fill', () => run('auto')); on('replay', () => run('template')); on('save', saveTemplate); on('undo', undo);
     on('stop', stopFilling);
     on('saveSettings', async () => { await saveRuleEdits(); toast('已保存当前页面的数字与文字随机设置'); });
-    on('saveRules', async () => { await saveRuleEdits(); toast('字段规则已保存'); });
+    on('saveRules', async () => { await saveRuleEdits(); toast(fields.some(f => !f.unique) ? '规则已保存；无法长期区分的同名项仅对当前控件生效' : '字段规则已保存'); });
     on('siteTemplates', () => renderTemplates(), 'change');
     on('templates', () => { const t = db.templates.find(t => t.id === ui.templates.value); if (t) { ui.templateName.value = t.name; templateNameAuto = false; } }, 'change');
     on('templateName', () => { templateNameAuto = false; }, 'input');
@@ -1349,15 +1476,18 @@
     });
     on('hideSite', () => setSiteMode('hide')); on('resetSite', () => setSiteMode('default'));
     for (const root of [ui.numberSettings, ui.textSettings]) root.addEventListener('change', () => syncGenerationControls(root));
-    ui.fields.addEventListener('change', event => { const row = event.target.closest('.field'); if (row) syncRuleRow(row); });
-    ui.inlineLayer.addEventListener('click', event => { const button = event.target.closest('.field-dice'), f = button && inlineFields.find(f => f.key === button.dataset.key); if (f) randomizeOne(f.desc); });
-    ui.inlineLayer.addEventListener('contextmenu', event => { const button = event.target.closest('.field-dice'), f = button && inlineFields.find(f => f.key === button.dataset.key); if (f && !busy) { event.preventDefault(); openFieldRule(f.desc); } });
+    ui.fields.addEventListener('change', event => { const row = event.target.closest('.field'); if (row) { row.dataset.edited = 'true'; syncRuleRow(row); } });
+    ui.fields.addEventListener('input', event => { const row = event.target.closest('.field'); if (row) row.dataset.edited = 'true'; });
+    ui.inlineLayer.addEventListener('click', event => { const button = event.target.closest('.field-dice'), f = button && inlineFields.find(f => f.uid === button.dataset.key); if (f) randomizeOne(liveReference(f)); });
+    ui.inlineLayer.addEventListener('contextmenu', event => { const button = event.target.closest('.field-dice'), f = button && inlineFields.find(f => f.uid === button.dataset.key); if (f && !busy) { event.preventDefault(); openFieldRule(liveReference(f)); } });
     addEventListener('scroll', () => scheduleInline(), { capture: true, passive: true });
     addEventListener('resize', () => scheduleInline(), { passive: true });
     ui.fields.addEventListener('click', event => {
       const button = event.target.closest('.locate,.random-one'); if (!button) return;
-      const f = fields.find(f => f.key === button.dataset.key); if (!f?.el.isConnected) return;
-      if (button.classList.contains('random-one')) { randomizeOne(f.desc); return; }
+      const original = fields.find(f => f.uid === button.dataset.key); if (!original) return;
+      if (button.classList.contains('random-one')) { randomizeOne(liveReference(original)); return; }
+      const match = matchLive(liveReference(original), collect(rootScope())), f = match.field;
+      if (!f) return toast(match.reason);
       f.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       const old = f.el.style.outline; f.el.style.outline = '3px solid #2563eb'; setTimeout(() => { f.el.style.outline = old; }, 1800);
     });
@@ -1398,20 +1528,30 @@
     ui.status.textContent = available ? `${available} 项内容可以填写` : '暂未发现可填写内容';
     ui.scopeHint.textContent = fields.length === 500 ? '当前识别前 500 项，超出部分请手动处理' : fields.length ? '已识别当前表单 · 搜索与筛选字段不参与' : '打开编辑表单或弹窗，助手会自动识别';
     ui.fieldCount.textContent = `${fields.length} 项`;
-    const rules = currentRules(), settings = currentSettings();
+    const settings = currentSettings();
     renderedRuleKey = ruleKey(); renderedRoot = rootScope();
     ui.numberSettings.innerHTML = numberControls(settings.number);
     ui.textSettings.innerHTML = textControls(settings.text);
     ui.fields.innerHTML = fields.map(f => {
-      const rule = rules[f.key] || { mode: 'auto', value: '' };
+      const rule = ruleFor(f);
       const numeric = ['text', 'textarea', 'number'].includes(f.kind), text = ['text', 'textarea'].includes(f.kind) && !textFormat(f);
       const modes = [['auto', '按页面设置生成'], ...(numeric ? [['number', '数字随机（单独设置）']] : []), ...(text ? [['text', '文字随机（单独设置）']] : []), ['fixed', '固定值'], ['skip', '跳过']];
-      return `<div class="field" data-key="${esc(f.key)}"><div class="field-top"><span class="field-name">${esc(f.label)}</span><span class="badge">${TYPES[f.kind]}</span><button class="action random-one" data-key="${esc(f.key)}" ${f.reason ? 'disabled' : ''}>⚄ 换此项</button><button class="locate" data-key="${esc(f.key)}">定位</button></div>${f.context ? `<div class="meta">${esc(f.context)}</div>` : ''}${f.reason ? `<div class="reason">${esc(f.reason)}</div>` : ''}<div class="row"><select class="mode" ${f.reason ? 'disabled' : ''}>${modes.map(([value, label]) => `<option value="${value}" ${rule.mode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div><input class="fixed" type="text" value="${esc(rule.value || '')}" placeholder="填写固定值" ${f.reason ? 'disabled' : ''}>${numeric ? `<div class="numeric-config">${numberControls({ ...settings.number, ...rule.number }, false)}</div>` : ''}${text ? `<div class="text-config">${textControls({ ...settings.text, ...rule.text })}</div>` : ''}</div>`;
+      return `<div class="field" data-key="${esc(f.uid)}"><div class="field-top"><span class="field-name">${esc(f.label)}</span><span class="badge">${TYPES[f.kind]}</span><button class="action random-one" data-key="${esc(f.uid)}" ${f.reason ? 'disabled' : ''}>⚄ 换此项</button><button class="locate" data-key="${esc(f.uid)}">定位</button></div>${f.context ? `<div class="meta">${esc(f.context)}</div>` : ''}${f.reason ? `<div class="reason">${esc(f.reason)}</div>` : ''}<div class="reason rule-warning" hidden></div><div class="row"><select class="mode" ${f.reason ? 'disabled' : ''}>${modes.map(([value, label]) => `<option value="${value}" ${rule.mode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div><input class="fixed" type="text" value="${esc(rule.value || '')}" placeholder="填写固定值" ${f.reason ? 'disabled' : ''}>${numeric ? `<div class="numeric-config">${numberControls({ ...settings.number, ...rule.number }, false)}</div>` : ''}${text ? `<div class="text-config">${textControls({ ...settings.text, ...rule.text })}</div>` : ''}</div>`;
     }).join('') || '<div class="empty-state">当前没有可填写的表单，搜索和筛选字段已自动排除。</div>';
     for (const row of qa('.field', ui.fields)) syncRuleRow(row);
+    updateRuleHints();
     updateInlineLabels(); scheduleInline(true); if (busy) setBusy(true);
     renderTemplates();
     suggestTemplateName();
+  }
+  function updateRuleHints() {
+    bindRules(fields);
+    ui.ruleHint.hidden = !fields.unresolvedRules;
+    ui.ruleHint.textContent = `${fields.unresolvedRules} 条已有规则无法可靠对应，原数据已保留；请检查并重新指定单项规则`;
+    for (const row of qa('.field', ui.fields)) {
+      const f = fields.find(item => item.uid === row.dataset.key), hint = q('.rule-warning', row);
+      if (f && hint) { hint.textContent = f.ruleWarning; hint.hidden = !f.ruleWarning; }
+    }
   }
   function renderTemplates(selected) {
     const id = selected || ui.templates.value, p = pageInfo();
