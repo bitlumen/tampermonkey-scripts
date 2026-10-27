@@ -1,0 +1,13 @@
+{
+  "name": "form-assistant",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Development checks for the standalone form assistant userscript",
+  "scripts": {
+    "check": "node --check form-assistant.user.js",
+    "test": "node --test tests/form-assistant.test.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}

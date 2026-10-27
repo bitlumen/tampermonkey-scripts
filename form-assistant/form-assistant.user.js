@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         系统测试填表助手
 // @namespace    https://github.com/bitlumen
-// @version      1.0.0
-// @description  自动识别当前表单并排除搜索区；一键填空、单项随机、可折叠模板、自定义文本库与生成偏好。本地及局域网默认显示。
+// @version      1.1.0
+// @description  三段快捷条：整表重填、填表设置、全局单项随机；支持模板、文本库与生成偏好。本地及局域网默认显示。
 // @author       enthem
 // @match        http://*/*
 // @match        https://*/*
@@ -10,6 +10,7 @@
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @license      MIT
 // ==/UserScript==
@@ -17,10 +18,11 @@
 (() => {
   'use strict';
   if (document.getElementById('tfa-host-v1')) return;
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const STORAGE = 'tfa.database.v1';
   const SITE_STORAGE = 'tfa.site-visibility.v1';
   const LIBRARY_STORAGE = 'tfa.text-library.v1';
+  const INLINE_STORAGE = 'tfa.inline-enabled.v1';
   const WRAP = '.el-form-item,.ant-form-item,.form-group,.form-item,[data-form-item],[data-field]';
   const COMBO = '.el-select,.ant-select:not(.ant-cascader),[role="combobox"]';
   const UNSUPPORTED = '.el-cascader,.ant-cascader,.el-tree-select,.ant-tree-select,.el-date-editor,.ant-picker';
@@ -48,6 +50,8 @@
   const emptyRoot = document.createElement('div');
   let host, shadow, ui, renderedRuleKey = '', renderedRoot = null;
   let inlineEnabled = false, inlineFields = [], inlineFrame = 0, inlineRebuild = false;
+  let inlineSaving = false, inlineRevision = 0;
+  let dockPinned = false, dockTimer;
   let generationSession = { online: [], error: '' }, activeRequest = null, lastOnlineRequest = 0;
   let libraryText = '', libraryError = '', libraryCache = { source: null, pool: [] }, libraryImporting = false;
   let templateNameKey = '', templateNameRoot = null, templateNameAuto = true;
@@ -140,10 +144,34 @@
     await GM_setValue(SITE_STORAGE, JSON.stringify(fresh));
     siteModes = fresh;
     cancelled = true; activeRequest?.abort();
-    opened = false; inlineEnabled = false;
+    opened = false; dockPinned = false;
     ui.panel.hidden = ui.toast.hidden = true;
-    ui.launcher.hidden = !siteEnabled(); ui.launcher.setAttribute('aria-expanded', 'false');
+    ui.dock.hidden = !siteEnabled(); ui.openSettings.setAttribute('aria-expanded', 'false');
+    setDockExpanded(false);
     updateInlineLabels(); scheduleInline(true);
+  }
+
+  function applyInlinePreference(value) {
+    inlineEnabled = value === true;
+    if (ui) {
+      if (!inlineEnabled) { inlineFields = []; ui.inlineLayer.replaceChildren(); }
+      updateInlineLabels(); scheduleInline(true);
+    }
+  }
+  async function syncInlinePreference() {
+    const revision = inlineRevision;
+    const value = await GM_getValue(INLINE_STORAGE, false);
+    if (revision === inlineRevision) applyInlinePreference(value);
+  }
+  async function setInlinePreference() {
+    if (inlineSaving) { updateInlineLabels(); return; }
+    const enabled = ui.globalInline.checked;
+    inlineSaving = true; ui.globalInline.disabled = true;
+    try {
+      await GM_setValue(INLINE_STORAGE, enabled);
+      await syncInlinePreference();
+      toast(inlineEnabled ? '单项随机已开启并记住选择：左键换值，右键设置规则' : '单项随机已关闭并记住选择');
+    } finally { inlineSaving = false; updateInlineLabels(); }
   }
 
   function visible(el) {
@@ -892,21 +920,26 @@
   }
   async function run(mode) {
     if (busy) return;
-    await saveRuleEdits();
-    refreshFields(false);
-    const startPage = pageKey(), startRoot = rootScope(), overwrite = ui.overwrite.checked;
-    const template = db.templates.find(t => t.id === ui.templates.value);
-    if (mode === 'template' && !template) return toast('请先选择模板');
-    if (mode === 'template' && template.page.origin !== location.origin) return toast('模板属于其他网站，请在对应网站使用');
-    busy = true; cancelled = false; reports = []; history = []; setBusy(true);
-    generationSession = { online: [], error: '' };
-    historyPage = startPage; historyRoot = startRoot;
-    const seed = ui.seed.value || '1';
-    const entries = mode === 'template' ? template.fields : fields.map(f => ({ descriptor: f.desc }));
-    const done = new Set(), planned = new Set(entries.map(e => hash(JSON.stringify(e.descriptor))));
-    const pending = entries.map(entry => ({ entry }));
-    const successes = [];
+    busy = true; cancelled = false; setBusy(true);
+    let started = false;
     try {
+      await saveRuleEdits();
+      if (cancelled) return toast('已停止，本次未填写');
+      refreshFields(true);
+      const startPage = pageKey(), startRoot = rootScope(), overwrite = mode === 'refresh' || ui.overwrite.checked;
+      const template = db.templates.find(t => t.id === ui.templates.value);
+      if (mode === 'template' && !template) return toast('请先选择模板');
+      if (mode === 'template' && template.page.origin !== location.origin) return toast('模板属于其他网站，请在对应网站使用');
+      if (!fields.some(f => !f.reason && ruleFor(f).mode !== 'skip')) return toast('当前表单没有可填写项，搜索、禁用和跳过字段不参与');
+      reports = []; history = []; started = true;
+      generationSession = { online: [], error: '' };
+      historyPage = startPage; historyRoot = startRoot;
+      // Quick refill uses a new batch seed without changing the reproducibility setting.
+      const seed = mode === 'refresh' ? `${ui.seed.value || '1'}:${uid()}` : ui.seed.value || '1';
+      const entries = mode === 'template' ? template.fields : fields.map(f => ({ descriptor: f.desc }));
+      const done = new Set(), planned = new Set(entries.map(e => hash(JSON.stringify(e.descriptor))));
+      const pending = entries.map(entry => ({ entry }));
+      const successes = [];
       // Bounded rescanning handles conditional fields and upstream option loading.
       for (let pass = 0; pass < 3 && pending.length && !cancelled; pass++) {
         const count = pending.length;
@@ -927,7 +960,7 @@
           const before = read(f);
           if (!overwrite && !isEmpty(before)) { report(f.label, 'skip', '已有内容，保留'); done.add(f.key); continue; }
           try {
-            const value = mode === 'template' ? entry.value : rule.mode === 'fixed' ? parseFixed(f, rule.value) : await generate(f, seed);
+            const value = mode === 'template' ? entry.value : rule.mode === 'fixed' ? parseFixed(f, rule.value) : mode === 'refresh' ? await generateDifferent(f, before, seed) : await generate(f, seed);
             if (cancelled || pageKey() !== startPage || !f.el.isConnected || rootScope() !== startRoot) throw new Error('页面已变化或操作已停止，未写入');
             if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
             // Capture before touching the control, including attempts that partially fail.
@@ -945,7 +978,7 @@
         }
         if (pass < 2 && !cancelled) {
           await sleep(250);
-          if (mode === 'auto' && pageKey() === startPage) {
+          if (mode !== 'template' && pageKey() === startPage) {
             for (const f of collect(startRoot)) if (!planned.has(f.key) && planned.size < 500) {
               planned.add(f.key); pending.push({ entry: { descriptor: f.desc } });
             }
@@ -963,10 +996,21 @@
       }
       if (cancelled) report('任务', 'skip', '已停止；之前的字段改动仍保留');
     } finally {
-      busy = false; setBusy(false); refreshFields(false); renderReports();
-      const count = reports.filter(r => r.status === 'ok').length;
-      toast(`完成：${count} 项已填，${reports.filter(r => r.status === 'fail' || r.status === 'warn').length} 项需检查`);
+      busy = false; setBusy(false);
+      if (started) {
+        refreshFields(false); renderReports();
+        const count = reports.filter(r => r.status === 'ok').length;
+        toast(`${cancelled ? '已停止' : '完成'}：${count} 项已填，${reports.filter(r => r.status === 'fail' || r.status === 'warn').length} 项需检查`, true);
+      }
     }
+  }
+  async function generateDifferent(f, before, seed) {
+    if (f.kind === 'checkbox' || f.kind === 'switch') return !before;
+    let value = await generate(f, seed);
+    const rule = ruleFor(f);
+    const online = (rule.mode === 'text' ? rule.text?.mode : currentSettings().text.mode) === 'online';
+    for (let attempt = 0; attempt < 8 && !online && !cancelled && same(value, before); attempt++) value = await generate(f, `${seed}:${attempt}`);
+    return value;
   }
   async function randomizeOne(desc) {
     if (busy) return;
@@ -982,12 +1026,7 @@
       const before = read(f), seed = `${ui.seed.value}:${uid()}`;
       let value;
       if (rule.mode === 'fixed') value = parseFixed(f, rule.value);
-      else if (f.kind === 'checkbox' || f.kind === 'switch') value = !before;
-      else {
-        value = await generate(f, seed);
-        const online = (rule.mode === 'text' ? rule.text?.mode : currentSettings().text.mode) === 'online';
-        for (let attempt = 0; attempt < 8 && !online && same(value, before); attempt++) value = await generate(f, `${seed}:${attempt}`);
-      }
+      else value = await generateDifferent(f, before, seed);
       if (cancelled || pageKey() !== page || !root.isConnected || rootScope() !== root || !f.el.isConnected) throw new Error('页面已变化或操作已停止，未写入');
       if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
       if (same(value, before)) { report(label, 'skip', '本次生成与原值相同，可调整规则或再次点击'); toast(`${label}：本次值相同，未改动`); return; }
@@ -997,7 +1036,7 @@
       await sleep(160);
       const error = fieldError(f) || (!same(read(f), snapshot.after) ? '页面联动改变了该值，请检查' : '');
       report(label, error ? 'warn' : 'ok', error || '已单独更新此字段', f.desc);
-      toast(error ? `${label}：${error}` : `已更新「${label}」；可在面板恢复本次`);
+      toast(error ? `${label}：${error}` : `已更新「${label}」`, true);
     } catch (error) { report(label, 'fail', error.message); toast(`${label}：${error.message}`); }
     finally { busy = false; setBusy(false); refreshFields(false); scheduleInline(true); }
   }
@@ -1044,7 +1083,7 @@
     return result;
   }
   async function saveRuleEdits() {
-    if (!ui || renderedRuleKey !== ruleKey()) return;
+    if (!ui || renderedRuleKey !== ruleKey() || renderedRoot !== rootScope()) return;
     const rules = { ...currentRules() };
     for (const row of qa('.field', ui.fields)) {
       const key = row.dataset.key, mode = q('.mode', row).value, value = q('.fixed', row).value;
@@ -1137,18 +1176,35 @@
     if (text) { text.hidden = mode !== 'text'; syncGenerationControls(text); }
   }
   function updateInlineLabels() {
-    ui.panelInline.setAttribute('aria-checked', String(inlineEnabled));
-    ui.inlineHint.textContent = inlineEnabled ? '左键随机换值 · 右键单独设置' : '在输入框旁显示随机按钮';
-    ui.launcher.title = inlineEnabled ? '打开填表助手 · 单项随机已开启' : '打开填表助手';
+    ui.globalInline.checked = inlineEnabled;
+    ui.globalInline.disabled = inlineSaving;
+    ui.inlineHint.textContent = inlineEnabled ? '单项随机已开启：左键换值，右键设置规则。快捷条开关在本浏览器各网站共用。' : '单项随机可在右下角快捷条开启；本浏览器各网站共用并记住选择。';
+    ui.launcher.title = inlineEnabled ? '展开填表快捷条 · 单项随机已开启' : '展开填表快捷条';
+    ui.launcher.dataset.inline = String(inlineEnabled);
   }
-  function closePanel() { opened = false; ui.panel.hidden = true; ui.launcher.setAttribute('aria-expanded', 'false'); ui.launcher.hidden = !siteEnabled(); scheduleInline(true); }
-  async function toggleInline() {
-    if (busy) return;
-    await saveRuleEdits();
-    refreshFields(true);
-    inlineEnabled = !inlineEnabled;
-    updateInlineLabels(); scheduleInline(true);
-    toast(inlineEnabled ? '单项随机已开启：点击骰子更新一项，右键骰子设置该字段规则' : '单项随机已关闭');
+  function setDockExpanded(expanded) {
+    const show = !!expanded || opened || busy;
+    ui.quickBar.hidden = !show; ui.launcher.hidden = show;
+    ui.launcher.setAttribute('aria-expanded', String(show));
+  }
+  function collapseDockSoon() {
+    clearTimeout(dockTimer);
+    dockTimer = setTimeout(() => {
+      if (!dockPinned && !ui.dock.matches(':hover') && !ui.dock.contains(shadow.activeElement)) setDockExpanded(false);
+    }, 220);
+  }
+  function closePanel() {
+    opened = false; ui.panel.hidden = true; ui.openSettings.setAttribute('aria-expanded', 'false');
+    ui.dock.hidden = !siteEnabled(); collapseDockSoon(); scheduleInline(true);
+  }
+  async function toggleSettings() {
+    if (!opened) { openPanel(); return; }
+    if (!busy) await saveRuleEdits();
+    closePanel();
+  }
+  function stopFilling() {
+    cancelled = true; activeRequest?.abort(); updateActionAvailability();
+    toast('正在停止；当前控件操作结束后停止');
   }
   function scheduleInline(rebuild = false) {
     inlineRebuild ||= rebuild;
@@ -1205,20 +1261,21 @@
   }
 
   const styles = `
-    :host{all:initial!important;position:fixed!important;inset:0!important;z-index:2147483646!important;pointer-events:none!important;color-scheme:light;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#253047}
+    :host{all:initial!important;position:fixed!important;inset:0!important;z-index:2147483646!important;pointer-events:none!important;color-scheme:light!important;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif!important;color:#253047!important}
     *{box-sizing:border-box}button,input,select,textarea{font:inherit}button{cursor:pointer;transition:background .15s,border-color .15s,box-shadow .15s}button:disabled{cursor:default;opacity:.45}button:focus-visible,summary:focus-visible{outline:3px solid #a5b4fc;outline-offset:3px}[hidden]{display:none!important}
-    .launcher-dock{pointer-events:none;position:fixed;right:0;bottom:14px;padding:10px 0 10px 10px;overflow:hidden}.launcher{pointer-events:auto;display:flex;align-items:center;gap:9px;border:1px solid #5264df;background:#4455ce;color:#fff;border-radius:16px 0 0 16px;padding:13px 18px 13px 12px;box-shadow:0 5px 20px #394db536;font-weight:650;font-size:14px;white-space:nowrap;transform:translateX(calc(100% - 40px));transition:transform .2s ease,background .15s,box-shadow .15s}.launcher:hover,.launcher:focus-visible{transform:translateX(0);background:#3949bb;box-shadow:0 7px 24px #394db54d}.launch-mark{font-size:19px;line-height:1;flex:none}.launch-label{opacity:0;transition:opacity .15s}.launcher:hover .launch-label,.launcher:focus-visible .launch-label{opacity:1}
-    .panel{pointer-events:auto;position:fixed;z-index:2;right:20px;top:24px;width:424px;max-width:calc(100vw - 24px);max-height:calc(100vh - 48px);display:flex;flex-direction:column;background:#f3f5fa;border:1px solid #e0e5ee;border-radius:22px;box-shadow:0 20px 64px #182d4d26,0 3px 14px #182d4d0a;overflow:hidden}.head{display:flex;align-items:center;gap:12px;padding:20px;background:#fff;border-bottom:1px solid #e8ecf3}.brand-mark{display:grid;place-items:center;background:#eef0ff;color:#5361d4;width:42px;height:42px;border-radius:13px;font-size:26px}.title{font-size:18px;font-weight:720;letter-spacing:.3px;color:#19253b}.sub{font-size:12px;color:#8490a4;margin-top:2px}.close{width:32px;height:32px;display:grid;place-items:center;border:0;background:transparent;border-radius:9px;color:#8490a4;font-size:24px;line-height:1}.close:hover{color:#35415a;background:#f1f3f8}
+    .launcher-dock{pointer-events:none;position:fixed;z-index:4;right:0;bottom:14px;padding:10px 0 10px 10px;max-width:100vw}.launcher{pointer-events:auto;position:relative;display:grid;place-items:center;width:40px;height:48px;border:1px solid #5264df;background:#4455ce;color:#fff;border-radius:16px 0 0 16px;box-shadow:0 5px 20px #394db536;font-size:21px}.launcher:hover{background:#3949bb}.launcher[data-inline=true]::after{content:'';position:absolute;left:7px;top:8px;width:6px;height:6px;border-radius:50%;background:#b3efd7;box-shadow:0 0 0 2px #4455ce}
+    .quickbar{pointer-events:auto;display:flex;align-items:stretch;max-width:calc(100vw - 10px);min-height:48px;background:#fff;border:1px solid #d4dcf3;border-radius:13px 0 0 13px;box-shadow:0 5px 24px #394db52b;overflow:hidden;font-size:13px}.quick-action,.quick-toggle{display:flex;align-items:center;justify-content:center;gap:6px;min-height:46px;padding:10px 12px;border:0;background:#fff;color:#5a6682;white-space:nowrap;font-weight:600;font-size:inherit}.quick-action+.quick-action,.quick-toggle{border-left:1px solid #e4e8f4}.quick-action.primary{background:#4455ce;color:#fff}.quick-action.primary:hover:not(:disabled){background:#3949bb}.quick-action[aria-expanded=true]{background:#edf0ff;color:#4455ce}.quick-action:hover:not(:disabled),.quick-toggle:hover{background:#f1f4ff}.quick-action[data-busy=true]{background:#b9636d}.quick-action[data-busy=true]:hover:not(:disabled){background:#a6535d}.quick-toggle{cursor:pointer}.quick-toggle input{accent-color:#5362d8}.quickbar button:focus-visible,.quick-toggle:focus-within{outline:3px solid #a5b4fc;outline-offset:-4px}.inline-note{padding-top:12px;margin-top:12px;border-top:1px solid #dde3f4}.toast button{margin-left:10px;border:1px solid #b9c6e9;border-radius:6px;padding:3px 7px;background:#fff;color:#4455ce;font-size:12px}.toast button:disabled{opacity:.5}
+    .panel{pointer-events:auto;position:fixed;z-index:2;right:20px;top:24px;width:424px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 112px);display:flex;flex-direction:column;background:#f3f5fa;border:1px solid #e0e5ee;border-radius:22px;box-shadow:0 20px 64px #182d4d26,0 3px 14px #182d4d0a;overflow:hidden}.head{display:flex;align-items:center;gap:12px;padding:20px;background:#fff;border-bottom:1px solid #e8ecf3}.brand-mark{display:grid;place-items:center;background:#eef0ff;color:#5361d4;width:42px;height:42px;border-radius:13px;font-size:26px}.title{font-size:18px;font-weight:720;letter-spacing:.3px;color:#19253b}.sub{font-size:12px;color:#8490a4;margin-top:2px}.close{width:32px;height:32px;display:grid;place-items:center;border:0;background:transparent;border-radius:9px;color:#8490a4;font-size:24px;line-height:1}.close:hover{color:#35415a;background:#f1f3f8}
     .body{min-height:0;padding:16px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#c9d1e0 transparent}.grow{flex:1;min-width:0}.row{display:flex;align-items:center;gap:8px}.row>*{min-width:0}.label{display:block;font-size:12px;font-weight:600;color:#53617a;margin:0 0 7px}.help{font-size:11px;line-height:1.65;color:#6f7c92;overflow-wrap:anywhere}.muted{font-size:11px;color:#95a0b1;margin-left:auto}.line{height:1px;background:#edf0f5;margin:16px 0}
     input[type=text],select,textarea.text-candidates,#libraryText{width:100%;min-height:38px;padding:9px 10px;background:#fff;border:1px solid #dde3ee;border-radius:9px;color:#35415a;outline:none;transition:border-color .15s,box-shadow .15s}input::placeholder,textarea::placeholder{color:#a2aab8}input[type=text]:focus,select:focus,textarea:focus{border-color:#8995ea;box-shadow:0 0 0 3px #eef0ff}select{cursor:pointer;padding-right:20px}input[type=checkbox]{width:14px;height:14px;accent-color:#5967d8;margin:0;flex:none}textarea.text-candidates,#libraryText{resize:vertical;min-height:100px;font-family:inherit;line-height:1.65}#libraryText{min-height:150px}
     .action{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:37px;padding:8px 12px;border:1px solid #dde3ed;background:#fff;color:#53617b;border-radius:9px;font-weight:550;white-space:nowrap}.action:hover:not(:disabled){border-color:#b6c0df;background:#f8faff}.action.primary{background:#5362d8;border-color:#5362d8;color:#fff;box-shadow:0 3px 8px #5362d827}.action.primary:hover:not(:disabled){background:#4655c7;border-color:#4655c7}.action.soft{background:#ffffffb3;border-color:#dce2f4;color:#6e7a99}.action.tint{background:#eef1ff;color:#5362c8;border-color:#e7ebff}.action.ghost{border-color:transparent;background:transparent}.action.danger{color:#c46972}.full{width:100%}.smallbtn{padding:5px 0;border:0;background:none;color:#6172d6;font-size:12px;text-align:left}.smallbtn:hover{text-decoration:underline}
-    .fill-card{padding:17px;background:linear-gradient(125deg,#eef1ff,#f8f9ff);border:1px solid #dee4fb;border-radius:15px;margin-bottom:13px}.card-top{display:flex;gap:10px;align-items:center}.eyebrow{color:#828db2;font-size:11px;margin-bottom:3px}.ready-count{font-size:18px;font-weight:680;color:#354478;letter-spacing:.2px}.icon-action{display:grid;place-items:center;width:30px;height:30px;border:1px solid #dce3f6;border-radius:9px;background:#ffffff91;color:#8b97b7;font-size:20px}.icon-action:hover{background:white;color:#5362d8}.status-hint{margin-top:4px;color:#7785a5}.fill-actions{display:flex;gap:8px;margin:16px 0 12px}.fill-actions .primary{min-height:42px;font-size:14px}.fill-actions .primary span{font-size:18px}.check-line{display:flex;align-items:center;gap:7px;color:#748099;font-size:12px;cursor:pointer;min-height:20px}.check-line.subtle{font-size:11px;margin:11px 0 0}.inline-option{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-top:13px;margin-top:13px;border-top:1px solid #dde3f4}.option-title{font-size:13px;font-weight:550;color:#5e6b8a}.inline-option .help{margin-top:2px}.switch{flex:none;width:37px;height:22px;border:0;border-radius:20px;background:#cbd2e2;padding:3px;box-shadow:inset 0 1px 2px #1b2b5220}.switch span{display:block;width:16px;height:16px;border-radius:50%;background:white;box-shadow:0 1px 3px #22335525;transition:transform .18s}.switch[aria-checked=true]{background:#6776dc}.switch[aria-checked=true] span{transform:translateX(15px)}
+    .fill-card{padding:17px;background:linear-gradient(125deg,#eef1ff,#f8f9ff);border:1px solid #dee4fb;border-radius:15px;margin-bottom:13px}.card-top{display:flex;gap:10px;align-items:center}.eyebrow{color:#828db2;font-size:11px;margin-bottom:3px}.ready-count{font-size:18px;font-weight:680;color:#354478;letter-spacing:.2px}.icon-action{display:grid;place-items:center;width:30px;height:30px;border:1px solid #dce3f6;border-radius:9px;background:#ffffff91;color:#8b97b7;font-size:20px}.icon-action:hover{background:white;color:#5362d8}.status-hint{margin-top:4px;color:#7785a5}.fill-actions{display:flex;gap:8px;margin:16px 0 12px}.fill-actions .primary{min-height:42px;font-size:14px}.fill-actions .primary span{font-size:18px}.check-line{display:flex;align-items:center;gap:7px;color:#748099;font-size:12px;cursor:pointer;min-height:20px}.check-line.subtle{font-size:11px;margin:11px 0 0}
     .section-card{margin:12px 0 0;background:#fff;border:1px solid #e3e8f0;border-radius:15px;overflow:hidden}.section-card>summary{display:flex;align-items:center;gap:11px;padding:15px;cursor:pointer;list-style:none;user-select:none}.section-card>summary:hover{background:#fbfcff}summary::-webkit-details-marker{display:none}.summary-copy{flex:1;min-width:0}.summary-copy strong{display:block;font-size:14px;font-weight:650;color:#3d4a62}.summary-copy small{display:block;font-size:11px;font-weight:400;color:#7e8ba1;margin-top:3px}.section-icon{display:grid;place-items:center;flex:none;width:34px;height:34px;border-radius:11px;font-size:21px}.amber{background:#fff4df;color:#c3a064}.violet{background:#f0edff;color:#9985d1}.teal{background:#e9f5f2;color:#6caa9c}.blue{background:#eaf1fc;color:#7e9cc7}.gray{background:#f0f2f6;color:#9aa4b5}.count-pill{font-size:10px;color:#9ba5b6;white-space:nowrap;background:#f5f7fa;padding:2px 6px;border-radius:6px}.chevron{display:block;flex:none;width:6px;height:6px;margin-right:3px;border-right:1.5px solid #a8b1c1;border-bottom:1.5px solid #a8b1c1;transform:rotate(-45deg);transition:transform .15s}details[open]>summary>.chevron{transform:rotate(45deg)}.section-body{padding:0 15px 16px}.section-card[open]>summary{padding-bottom:13px}.templates-card[open]>summary{border-bottom:1px solid #f3f1eb;margin-bottom:14px}.template-actions{display:flex;gap:7px;margin-top:10px}.save-box{padding:12px;margin-top:15px;border:1px solid #edf0f5;border-radius:10px;background:#f9fafc}.save-box input{font-size:12px}.save-bottom{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}.save-bottom .action{min-height:31px;padding:5px 11px;font-size:12px}.save-bottom .help{font-size:10px}.empty-state{font-size:12px;line-height:1.7;color:#99a3b4;background:#f8f9fc;border-radius:9px;padding:12px;margin-bottom:12px}
     .setting-block{background:#f8f9fc;border:1px solid #edf0f6;border-radius:11px;padding:12px;margin:0 0 12px}.setting-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0 9px}.setting-grid label,.digits-label{font-size:11px;color:#7e8aa0}.setting-grid input{margin-top:5px}.digits-label{display:block;margin:10px 0}.digits-label select{margin-top:5px}.inset-details{background:#fafbfe;border:1px solid #e9edf4;border-radius:9px;margin:11px 0}.inset-details>summary{display:flex;align-items:center;justify-content:space-between;padding:11px;font-size:12px;font-weight:550;color:#75839d;cursor:pointer;list-style:none}.inset-body{padding:0 11px 12px}.library-actions{margin-top:10px;margin-bottom:9px}.library-note{margin:8px 0}.online-note a{color:#6172d6}.numeric-config,.text-config{padding:10px;background:#f6f8fc;border-radius:9px;margin-top:10px}
     .field{border:1px solid #e6eaf2;border-radius:11px;padding:11px;margin:11px 0;background:#fff}.field-top{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.field-name{font-size:12px;font-weight:600;flex:1;min-width:90px;overflow-wrap:anywhere;color:#56627b}.badge{font-size:10px;background:#f4f6fa;color:#9aa4b5;padding:2px 5px;border-radius:4px}.field .row{margin-top:9px}.field .mode{width:100%;font-size:12px}.field input{font-size:12px}.field .fixed{width:100%;margin-top:9px}.field .locate{border:0;color:#8391c6;background:none;font-size:11px;padding:0}.field .random-one{min-height:25px;padding:2px 6px;font-size:11px;color:#8191c9}.field .meta{font-size:10px;color:#a0a8b8;margin-top:6px}.reason{font-size:11px;color:#b99b70;margin-top:7px}.numeric-config select,.text-config select{width:100%}
     .stats{font-size:12px;color:#8390a6;margin-bottom:10px}#results{max-height:260px;overflow:auto}.result{border-left:2px solid #c8ced9;padding:8px 10px;margin:7px 0;font-size:11px;line-height:1.6;background:#f8f9fc;border-radius:0 7px 7px 0;color:#6f7c92;overflow-wrap:anywhere}.result.ok{border-color:#80b9a0}.result.fail{border-color:#d68e94}.result.warn{border-color:#d7b578}.result b{color:#64728a;font-weight:550}.footer{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 20px;border-top:1px solid #e7ebf2;background:#fbfcfe;font-size:10px;color:#a0aaba}.footer-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#9bb9ad;margin-right:6px;vertical-align:middle}.toast{pointer-events:auto;position:fixed;z-index:3;bottom:90px;right:22px;max-width:min(400px,calc(100vw - 32px));background:#35415b;color:white;padding:12px 16px;border-radius:12px;box-shadow:0 6px 25px #26355130;font-size:12px;line-height:1.6;white-space:pre-wrap}
     #inlineLayer{pointer-events:none}.field-dice{pointer-events:auto;position:fixed;width:24px;height:24px;display:flex;align-items:center;justify-content:center;padding:0;border:1px solid #c3ccef;border-radius:7px;background:#f0f3ff;color:#6978d4;font-size:20px;line-height:1;box-shadow:0 2px 5px #5362d820}.field-dice:hover{background:#6878d7;border-color:#6878d7;color:white}.field-dice:focus-visible{outline:3px solid #acb9f8}
-    @media(max-width:550px){.panel{right:10px;top:10px;max-width:calc(100vw - 20px);max-height:calc(100dvh - 20px);border-radius:18px}.head{padding:15px}.body{padding:12px}.launcher-dock{bottom:4px}.muted{font-size:10px}.footer{padding:11px 16px}}
+    @media(max-width:550px){.panel{right:10px;top:10px;max-width:calc(100vw - 20px);max-height:calc(100dvh - 92px);border-radius:18px}.head{padding:15px}.body{padding:12px}.launcher-dock{bottom:4px}.quickbar{font-size:12px}.quick-action,.quick-toggle{padding:10px}.muted{font-size:10px}.footer{padding:11px 16px}}
     @media(prefers-reduced-motion:reduce){*{transition:none!important}}
   `;
   function mount() {
@@ -1227,7 +1284,7 @@
     shadow = host.attachShadow({ mode: 'open' });
     shadow.innerHTML = `<style>${styles}</style>
       <div id="inlineLayer"></div>
-      <div class="launcher-dock"><button class="launcher" id="launcher" title="打开填表助手" aria-expanded="false" aria-controls="panel"><span class="launch-mark" aria-hidden="true">✦</span><span class="launch-label">填表助手</span></button></div>
+      <div class="launcher-dock" id="dock"><button type="button" class="launcher" id="launcher" title="展开填表快捷条" aria-label="展开填表快捷条" aria-expanded="false" aria-controls="quickBar"><span aria-hidden="true">✦</span></button><div class="quickbar" id="quickBar" role="group" aria-label="填表快捷操作" hidden><button type="button" class="quick-action primary" id="quickFill" title="按当前规则重新生成并覆盖当前表单"><span id="quickFillIcon" aria-hidden="true">⟳</span><span id="quickFillLabel">整表重填</span></button><button type="button" class="quick-action" id="openSettings" aria-expanded="false" aria-controls="panel"><span aria-hidden="true">⚙</span><span>填表设置</span></button><label class="quick-toggle" title="在字段旁显示骰子，本浏览器各网站共用并记住选择"><input id="globalInline" type="checkbox"><span>单项随机</span></label></div></div>
       <section class="panel" id="panel" hidden aria-label="系统测试填表助手">
         <header class="head"><div class="brand-mark" aria-hidden="true">✦</div><div class="grow"><div class="title">系统测试填表助手</div><div class="sub">为当前表单准备测试数据</div></div><button class="close" id="close" title="收起面板" aria-label="收起面板">×</button></header>
         <div class="body">
@@ -1236,7 +1293,7 @@
             <div class="help status-hint" id="scopeHint">自动识别最上层表单，跳过搜索与筛选区</div>
             <div class="fill-actions"><button class="action primary grow" id="fill"><span aria-hidden="true">✦</span> 一键填空</button><button class="action soft" id="undo">恢复本次</button><button class="action danger" id="stop" hidden>停止</button></div>
             <label class="check-line"><input type="checkbox" id="overwrite"><span>覆盖已有内容</span><span class="muted">默认只填空项</span></label>
-            <div class="inline-option"><div><div class="option-title">单项随机</div><div class="help" id="inlineHint">在输入框旁显示随机按钮</div></div><button type="button" class="switch" id="panelInline" role="switch" aria-checked="false" aria-label="单项随机"><span></span></button></div>
+            <div class="help inline-note" id="inlineHint"></div>
           </section>
 
           <details class="section-card" id="generationDetails" open><summary><span class="section-icon violet" aria-hidden="true">◈</span><span class="summary-copy"><strong>生成偏好</strong><small>数字范围、文本来源与长度</small></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body">
@@ -1257,18 +1314,22 @@
           </div></details>
           <details class="section-card" id="moreDetails"><summary><span class="section-icon gray" aria-hidden="true">⋯</span><span class="summary-copy"><strong>备份与更多</strong><small>导入导出、站点显示设置</small></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><label class="check-line"><input type="checkbox" id="importCurrentSite"><span>导入到当前网站</span></label><div class="help">同一系统跨环境使用时勾选，页面路径保持不变；不勾选则保留原网站归属。</div><div class="row library-actions"><button class="action grow" id="export">导出本站模板</button><button class="action grow" id="import">导入 JSON</button><input type="file" id="importFile" accept=".json,application/json" hidden></div><div class="help">模板仅存于本机，导出文件包含字段值。自定义文本库请保留 TXT 原文件。</div><div class="line"></div><div class="label">网站显示</div><div class="help">本地与局域网默认显示。其他网站可通过油猴菜单手动开启。</div><div class="row library-actions"><button class="action grow" id="hideSite">在本站隐藏</button><button class="action grow" id="resetSite">恢复默认</button></div><details class="inset-details"><summary>使用说明<span class="chevron" aria-hidden="true"></span></summary><div class="inset-body help">默认跳过密码、验证码、文件、富文本和未适配控件。填写会触发页面联动；有自动保存功能的页面可能写入后台。“恢复本次”尽力恢复字段内容，不能回滚后台保存。复杂业务约束请以页面校验为准。</div></details></div></details>
         </div><footer class="footer"><span><i class="footer-dot"></i>本地保存 · 由你决定何时提交</span><span>v${VERSION}</span></footer>
-      </section><div class="toast" id="toast" role="status" hidden></div>
+      </section><div class="toast" id="toast" role="status" hidden><span id="toastMessage"></span><button type="button" id="toastUndo" hidden>恢复本次</button></div>
 `;
     document.documentElement.append(host);
     ui = Object.fromEntries(qa('[id]', shadow).map(el => [el.id, el]));
     ui.libraryText.value = libraryText; updateLibraryStatus();
     const on = (id, fn, event = 'click') => ui[id].addEventListener(event, async () => { try { await fn(); } catch (err) { toast(`操作失败：${err.message}`); console.error('[系统测试填表助手]', err); } });
-    on('launcher', () => openPanel()); on('close', async () => { await saveRuleEdits(); closePanel(); });
-    on('panelInline', toggleInline);
+    on('launcher', () => { clearTimeout(dockTimer); dockPinned = true; setDockExpanded(true); ui.openSettings.focus({ preventScroll: true }); });
+    on('openSettings', toggleSettings);
+    on('close', async () => { if (!busy) await saveRuleEdits(); closePanel(); });
+    on('quickFill', () => busy ? stopFilling() : run('refresh'));
+    on('globalInline', setInlinePreference, 'change');
+    on('toastUndo', undo);
     on('scan', async () => { await saveRuleEdits(); refreshFields(true); });
     on('newSeed', () => { ui.seed.value = String(Date.now()).slice(-8); });
     on('fill', () => run('auto')); on('replay', () => run('template')); on('save', saveTemplate); on('undo', undo);
-    on('stop', () => { cancelled = true; activeRequest?.abort(); toast('正在停止；当前控件操作结束后停止'); });
+    on('stop', stopFilling);
     on('saveSettings', async () => { await saveRuleEdits(); toast('已保存当前页面的数字与文字随机设置'); });
     on('saveRules', async () => { await saveRuleEdits(); toast('字段规则已保存'); });
     on('siteTemplates', () => renderTemplates(), 'change');
@@ -1300,7 +1361,20 @@
       f.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       const old = f.el.style.outline; f.el.style.outline = '3px solid #2563eb'; setTimeout(() => { f.el.style.outline = old; }, 1800);
     });
-    ui.launcher.hidden = !siteEnabled();
+    ui.dock.hidden = !siteEnabled();
+    ui.dock.addEventListener('pointerenter', event => {
+      clearTimeout(dockTimer);
+      if (event.pointerType === 'mouse') dockTimer = setTimeout(() => setDockExpanded(true), 150);
+    });
+    ui.dock.addEventListener('pointerleave', collapseDockSoon);
+    ui.dock.addEventListener('focusout', collapseDockSoon);
+    ui.launcher.addEventListener('focus', () => {
+      if (ui.launcher.matches(':focus-visible')) { setDockExpanded(true); ui.openSettings.focus({ preventScroll: true }); }
+    });
+    document.addEventListener('pointerdown', event => {
+      if (event.composedPath().includes(ui.dock)) return;
+      dockPinned = false; clearTimeout(dockTimer); setDockExpanded(false);
+    }, true);
     if (typeof GM_registerMenuCommand === 'function') {
       const menu = (label, action) => GM_registerMenuCommand(label, async () => {
         try { await action(); } catch (error) { toast(`操作失败：${error.message}`); console.error('[系统测试填表助手]', error); }
@@ -1310,7 +1384,13 @@
       menu('本站恢复默认（仅本地 / 局域网显示）', () => setSiteMode('default'));
     }
   }
-  function openPanel() { opened = true; ui.launcher.setAttribute('aria-expanded', 'true'); ui.launcher.hidden = true; ui.panel.hidden = false; refreshFields(true); scheduleInline(); }
+  function openPanel() {
+    if (opened) return;
+    opened = true; ui.openSettings.setAttribute('aria-expanded', 'true');
+    ui.panel.hidden = false; setDockExpanded(true);
+    if (!busy) refreshFields(true);
+    scheduleInline();
+  }
   function refreshFields(rebuild) {
     if (rebuild) discoverScopes();
     fields = collect(rootScope()); structureDirty = false;
@@ -1353,6 +1433,8 @@
     for (const el of qa('textarea', ui.panel)) el.disabled = value;
     scheduleInline();
     ui.stop.hidden = !value; ui.stop.disabled = false;
+    if (value) { ui.toast.hidden = true; setDockExpanded(true); }
+    else collapseDockSoon();
     updateActionAvailability();
   }
   function updateActionAvailability() {
@@ -1361,9 +1443,18 @@
     ui.replay.disabled = busy || !available || !template;
     ui.delete.disabled = busy || !template; ui.templates.disabled = busy || !template;
     ui.undo.disabled = busy || !history.length;
+    ui.toastUndo.disabled = busy || !history.length;
+    ui.quickFillLabel.textContent = busy ? (cancelled ? '正在停止' : '停止填写') : '整表重填';
+    ui.quickFillIcon.textContent = busy ? '■' : '⟳';
+    ui.quickFill.dataset.busy = String(busy); ui.quickFill.disabled = busy && cancelled;
+    ui.quickFill.title = busy ? '停止后续填写，保留本次已完成的改动' : '按当前规则重新生成并覆盖当前表单';
   }
   let toastTimer;
-  function toast(message) { clearTimeout(toastTimer); ui.toast.textContent = message; ui.toast.hidden = false; toastTimer = setTimeout(() => { ui.toast.hidden = true; }, 5500); }
+  function toast(message, restorable = false) {
+    clearTimeout(toastTimer); ui.toastMessage.textContent = message;
+    ui.toastUndo.hidden = !restorable || !history.length; ui.toastUndo.disabled = busy;
+    ui.toast.hidden = false; toastTimer = setTimeout(() => { ui.toast.hidden = true; }, restorable ? 9000 : 5500);
+  }
 
   async function init() {
     let storageError = '';
@@ -1379,7 +1470,16 @@
     catch (error) { console.error('[系统测试填表助手] 无法读取网站显示设置', error); }
     try { libraryText = validateLibrary(await GM_getValue(LIBRARY_STORAGE, '')); }
     catch (error) { libraryError = error.message; console.error('[系统测试填表助手] 无法读取自定义文本库', error); }
-    mount(); if (siteEnabled()) discoverScopes(); lastPageKey = pageKey();
+    if (typeof GM_addValueChangeListener === 'function') {
+      try { GM_addValueChangeListener(INLINE_STORAGE, (_key, _oldValue, value) => { inlineRevision++; applyInlinePreference(value); }); }
+      catch (error) { console.error('[系统测试填表助手] 无法订阅单项随机设置', error); }
+    }
+    try { await syncInlinePreference(); }
+    catch (error) { console.error('[系统测试填表助手] 无法读取单项随机设置', error); }
+    mount(); if (siteEnabled()) refreshFields(true); updateInlineLabels(); scheduleInline(true); lastPageKey = pageKey();
+    const resyncInline = () => syncInlinePreference().catch(error => console.error('[系统测试填表助手] 无法同步单项随机设置', error));
+    addEventListener('focus', resyncInline);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) resyncInline(); });
     if (storageError) { toast(`读取存储失败：${storageError}。请先备份已有数据；当前会话不可保存。`); persist = async () => { throw new Error('存储读取失败，已禁止覆盖已有数据'); }; }
     let debounce;
     new MutationObserver(mutations => {
