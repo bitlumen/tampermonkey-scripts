@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         系统测试填表助手
 // @namespace    https://github.com/bitlumen
-// @version      1.2.0
+// @version      1.3.0
 // @description  三段快捷条：整表重填、填表设置、全局单项随机；支持模板、文本库与生成偏好。本地及局域网默认显示。
 // @author       enthem
 // @match        http://*/*
@@ -18,19 +18,23 @@
 (() => {
   'use strict';
   if (document.getElementById('tfa-host-v1')) return;
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const STORAGE = 'tfa.database.v1';
   const SITE_STORAGE = 'tfa.site-visibility.v1';
   const LIBRARY_STORAGE = 'tfa.text-library.v1';
   const INLINE_STORAGE = 'tfa.inline-enabled.v1';
   const WRAP = '.el-form-item,.ant-form-item,.form-group,.form-item,[data-form-item],[data-field]';
   const COMBO = '.el-select,.ant-select:not(.ant-cascader),[role="combobox"]';
-  const UNSUPPORTED = '.el-cascader,.ant-cascader,.el-tree-select,.ant-tree-select,.el-date-editor,.ant-picker';
+  const PICKER = '.el-date-editor,.ant-picker';
+  const CASCADER = '.el-cascader,.ant-cascader';
+  const TREE = '.el-tree-select,.ant-tree-select';
+  const COMPONENT = `${PICKER},${CASCADER},${TREE}`;
+  const POPUP = '.ant-picker-dropdown,.el-picker__popper,.el-picker-panel,.el-time-panel,.el-time-range-picker,.ant-select-dropdown,.ant-cascader-dropdown,.ant-cascader-menus,.el-cascader__dropdown,.el-select__popper,.el-select-dropdown';
   const CONTROL = 'input,textarea,select,[role="combobox"],[role="switch"],[role="checkbox"],[role="radio"],[contenteditable="true"],.el-select,.ant-select,.el-cascader,.el-tree-select,.el-date-editor,.ant-picker';
   const FORM = 'form,[role="form"],.el-form,.ant-form';
   const OVERLAY = 'dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"],.el-dialog,.ant-modal-content,.el-drawer,.ant-drawer-content';
   const SEARCH_AREA = 'search,[role="search"],.ant-pro-query-filter,.ant-pro-table-search,.ant-table-filter-dropdown,.el-table-filter,.search-form,.searchForm,.search-bar,.search-panel,.search-box,.filter-form,.filter-bar,.query-form,[data-search-form]';
-  const TYPES = { text: '文本', textarea: '多行', number: '数字', select: '下拉', combo: '组件下拉', radio: '单选组', checkbox: '复选', switch: '开关', date: '日期/时间', rich: '富文本', unsupported: '需适配' };
+  const TYPES = { text: '文本', textarea: '多行', number: '数字', select: '下拉', combo: '组件下拉', picker: '日期组件', cascader: '级联选择', tree: '树选择', radio: '单选组', checkbox: '复选', switch: '开关', date: '日期/时间', rich: '富文本', unsupported: '需适配' };
   const norm = v => String(v ?? '').replace(/\s+/g, ' ').trim();
   const clean = v => norm(v).replace(/^[*＊\s]+|[:：*＊\s]+$/g, '');
   const arr = x => Array.from(x || []);
@@ -199,7 +203,7 @@
   }
   function pageKey() { const p = pageInfo(); return p.origin + p.path; }
   function controlOwner(el) {
-    return el.closest(UNSUPPORTED) || el.closest('.el-select,.ant-select,.ant-input-number,.el-input-number,[role="radiogroup"],.el-radio-group,.ant-radio-group') ||
+    return el.closest(COMPONENT) || el.closest('.el-select,.ant-select,.ant-input-number,.el-input-number,[role="radiogroup"],.el-radio-group,.ant-radio-group') ||
       el.closest('[role="combobox"],[role="switch"]') || el;
   }
   function localFieldLabel(el) {
@@ -280,7 +284,9 @@
       kind: f.kind, type: f.type || '', name: f.el.getAttribute('name') || input?.name || '',
       id: !unstable(f.el.id) ? f.el.id : (!unstable(input?.id) ? input.id : ''),
       testid: f.el.getAttribute('data-testid') || f.el.getAttribute('data-test') || input?.getAttribute('data-testid') || '',
-      label: legacy ? f.legacyLabel : f.label, context: legacy ? contextFor(f.el, true) : f.context, placeholder: input?.getAttribute('placeholder') || ''
+      label: legacy ? f.legacyLabel : f.label, context: legacy ? contextFor(f.el, true) : f.context,
+      // These components hide their placeholder when selected; it is not an identity.
+      placeholder: !legacy && ['picker', 'cascader', 'tree'].includes(f.kind) ? '' : input?.getAttribute('placeholder') || ''
     };
   }
   function identity(f) { return hash(JSON.stringify(f.desc)); }
@@ -314,7 +320,7 @@
     if (form && searchRegion(form)) return true;
     const area = el.closest('.toolbar,.search-area,.filter-area,.query-panel,.el-form--inline,.ant-form-inline');
     if (area && searchRegion(area)) return true;
-    if (kind === 'combo' || kind === 'unsupported' || el.closest(COMBO)) return false;
+    if (['combo', 'picker', 'cascader', 'tree', 'unsupported'].includes(kind) || el.closest(COMBO)) return false;
     if (el.matches('input[type="search"],[enterkeyhint="search"]')) return true;
     const hint = [el.getAttribute('placeholder'), el.getAttribute('aria-label'), labelFor(el)].filter(Boolean).join(' ');
     return /(?:搜索|请输入.*关键词|输入.*进行查询|搜索关键词)|\bsearch\b/i.test(hint) || /^(search|searchText|searchKeyword|searchQuery|queryText|q)$/i.test(el.getAttribute('name') || '');
@@ -322,12 +328,15 @@
   function collect(root) {
     const result = [], seen = new Set(), radioGroups = new Map();
     for (const item of qa(CONTROL, root)) {
-      if (item === host || host.contains(item)) continue;
+      if (item === host || host.contains(item) || item.closest(POPUP)) continue;
       let el = item, kind, type = item.type || '';
-      const special = item.closest(UNSUPPORTED);
+      const special = item.closest(COMPONENT);
       const combo = item.closest('.el-select,.ant-select:not(.ant-cascader)') || item.closest('[role="combobox"]');
-      if (special && root.contains(special)) { el = special; kind = 'unsupported'; }
-      else if (combo && root.contains(combo) && !combo.matches('select')) { el = combo; kind = 'combo'; }
+      if (special && root.contains(special)) {
+        el = special; kind = el.matches(PICKER) ? 'picker' : el.matches(CASCADER) ? 'cascader' : 'tree';
+        type = kind === 'picker' ? (pickerInputs(el).length === 2 ? 'range' : 'single') : '';
+      }
+      else if (combo && root.contains(combo) && !combo.matches('select')) { el = combo; kind = linkedTree(combo) ? 'tree' : 'combo'; }
       else if (item.closest('[contenteditable="true"]')) { el = item.closest('[contenteditable="true"]'); kind = 'rich'; }
       else if (item.matches('input')) {
         if (/^(hidden|button|submit|reset|image)$/.test(type)) continue;
@@ -365,7 +374,7 @@
       f.legacyDesc = descriptor(f, true); f.legacyKey = hash(JSON.stringify(f.legacyDesc));
       if (!nodeIds.has(el)) nodeIds.set(el, `field-${++nextNodeId}`);
       f.uid = nodeIds.get(el);
-      f.reason = sensitive(f) ? '敏感或认证字段，跳过' : disabled(el) ? '控件已禁用' : (el.readOnly && kind !== 'combo') ? '字段只读' : kind === 'rich' ? '富文本编辑器需单独适配' : kind === 'unsupported' ? '文件/日期组件/级联控件需手动处理' : '';
+      f.reason = sensitive(f) ? '敏感或认证字段，跳过' : disabled(el) || (['picker', 'cascader', 'tree'].includes(kind) && pickerInputs(el).some(disabled)) ? '控件已禁用' : (el.readOnly && !['combo', 'picker'].includes(kind)) ? '字段只读' : kind === 'rich' ? '富文本编辑器需单独适配' : kind === 'unsupported' ? '文件控件需手动选择文件' : '';
       if (!f.label) f.label = `未命名${TYPES[kind] || '字段'}`;
       result.push(f);
     }
@@ -393,7 +402,7 @@
       for (let i = 0; i < Math.max(a.path.length, b.path.length); i++) { const delta = (b.path[i] || 0) - (a.path[i] || 0); if (delta) return delta; }
       return a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? 1 : -1;
     })[0]?.el;
-    const overlays = [...new Set(qa(OVERLAY).filter(shown).map(el => {
+    const overlays = [...new Set(qa(OVERLAY).filter(shown).filter(el => !el.closest(POPUP)).map(el => {
       return el.matches('[role="dialog"],[role="alertdialog"],dialog,[aria-modal="true"]') ? el : el.closest('[role="dialog"],[role="alertdialog"],dialog,[aria-modal="true"]') || el;
     }))].filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth; });
     const overlay = topmost(overlays);
@@ -501,6 +510,8 @@
     return { number: { ...defaults.number, ...saved.number }, text: { ...defaults.text, ...saved.text } };
   }
   function read(f) {
+    if (f.kind === 'picker') { const values = pickerInputs(f.el).map(el => el.value); return values.some(Boolean) ? values : []; }
+    if (f.kind === 'cascader' || f.kind === 'tree') return hierarchyValues(f.el);
     if (f.kind === 'radio') {
       const selected = f.members.find(e => e.checked || e.getAttribute('aria-checked') === 'true');
       return selected ? { value: selected.value ?? selected.getAttribute('data-value') ?? '', text: radioOptionLabel(selected) } : null;
@@ -534,7 +545,7 @@
     }
     return f.el.value ?? f.el.textContent ?? '';
   }
-  function compatible(a, b) { return a.kind === b.kind && (!(a.kind === 'text' || a.kind === 'date') || a.type === b.type); }
+  function compatible(a, b) { return a.kind === b.kind && (!['text', 'date', 'picker'].includes(a.kind) || a.type === b.type); }
   function matchField(desc, candidates) {
     const scoreFor = target => {
       let score = 0;
@@ -838,7 +849,7 @@
       if (!opts.length) throw new Error('暂无可选项，可能需先填写上游字段');
       const e = opts[Math.floor(random() * opts.length)]; return [{ value: e.value, text: clean(e.textContent) }];
     }
-    if (f.kind === 'combo') return { auto: true, seed };
+    if (['combo', 'picker', 'cascader', 'tree'].includes(f.kind)) return { auto: true, seed };
     const format = textFormat(f);
     if (!format) return generatedText(f, random, rule.mode === 'text' ? { ...settings.text, ...rule.text } : settings.text);
     let value;
@@ -919,7 +930,7 @@
         await sleep(700);
       }
       let opts = comboOptions(f);
-      if (!opts.length) throw new Error('未找到可见选项；远程搜索或级联需手动处理');
+      if (!opts.length) throw new Error('未找到可见选项；远程搜索或未适配的下拉需手动加载');
       if (!wanted) {
         const pool = opts.filter(o => !o.selected);
         const opt = pool.length ? pool[Math.floor(rng(`${desired.seed}:${f.key}`)() * pool.length)] : opts[0]; pointerClick(opt.el); await sleep(160);
@@ -948,8 +959,281 @@
       if (!same([...read(f)].sort(), [...wanted].sort())) throw new Error('组件显示值与模板不一致');
     } finally { await closeCombo(f); }
   }
+  // Component adapters use public DOM interactions, never React/Vue private state.
+  function pickerInputs(el) { return (el.matches('input') ? [el] : qa('input', el)).filter(e => e.type !== 'hidden' && visible(e)); }
+  function linkedTree(el) {
+    return qa('[aria-controls],[aria-owns]', el).some(input => `${input.getAttribute('aria-controls') || ''} ${input.getAttribute('aria-owns') || ''}`.split(/\s+/).some(id => document.getElementById(id)?.closest('.el-tree-select__popper')));
+  }
+  function popupRoots() { const all = qa(POPUP).filter(visible); return all.filter(p => !all.some(other => other !== p && other.contains(p))); }
+  function componentSession(f) { return { f, page: pageKey(), root: rootScope(), prior: new Set(popupRoots()), popup: null }; }
+  function componentAlive(s) {
+    if (cancelled || pageKey() !== s.page || !s.f.el.isConnected || rootScope() !== s.root || disabled(s.f.el) || pickerInputs(s.f.el).some(disabled)) throw new Error('页面或控件已变化，已停止组件填写');
+  }
+  async function componentWait(s, predicate, message, timeout = 3000) {
+    const end = Date.now() + timeout;
+    do { componentAlive(s); const result = predicate(); if (result) return result; await sleep(60); } while (Date.now() < end);
+    throw new Error(message);
+  }
+  function ownedPopup(s) {
+    const nodes = [s.f.el, ...pickerInputs(s.f.el)];
+    const ids = nodes.flatMap(el => `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`.split(/\s+/)).filter(Boolean);
+    const linked = ids.map(id => document.getElementById(id)).filter(Boolean);
+    const roots = popupRoots();
+    const matched = roots.filter(p => linked.some(el => p === el || p.contains(el) || el.contains(p)));
+    const candidates = matched.length ? matched : roots.filter(p => !s.prior.has(p) || p === s.popup);
+    if (candidates.length > 1) throw new Error('出现多个组件面板，无法确定归属');
+    if (candidates.length === 1) s.popup = candidates[0];
+    return candidates[0] || null;
+  }
+  function componentKey(el, key) { el.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true, composed: true })); }
+  async function openComponent(s, index = 0) {
+    componentAlive(s);
+    const input = pickerInputs(s.f.el)[index] || comboInput(s.f.el) || s.f.el;
+    input.focus({ preventScroll: true }); pointerClick(input);
+    return componentWait(s, () => ownedPopup(s), '组件面板未打开，或无法确定面板归属');
+  }
+  async function closeComponent(s) {
+    if (!s.f.el.isConnected || pageKey() !== s.page) return;
+    for (const input of pickerInputs(s.f.el)) { componentKey(input, 'Escape'); input.blur(); }
+    if (s.popup && visible(s.popup)) { pointerClick(host); await sleep(80); }
+  }
+  async function clearComponent(s) {
+    if (isEmpty(read(s.f))) return;
+    componentAlive(s);
+    s.f.el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+    s.f.el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    await sleep(80);
+    const selector = s.f.kind === 'picker' ? '.ant-picker-clear,.el-input__clear,.el-range__close-icon,.clear-icon' : '.ant-select-clear,.el-input__clear,.el-select__clear,.el-select__caret.is-show-close,.el-cascader .icon-circle-close';
+    const clear = q(selector, s.f.el);
+    if (!clear || disabled(clear)) throw new Error('组件没有可用的清空按钮，原值未清除');
+    pointerClick(clear);
+    await componentWait(s, () => isEmpty(read(s.f)), '组件未接受清空操作');
+  }
+  function calendarCells(popup) {
+    const selector = '.ant-picker-cell,.el-date-table td,.el-month-table td,.el-year-table td';
+    return qa(selector, popup).filter(el => visible(el) && !disabled(el) && !el.matches('.ant-picker-cell-disabled,.disabled,.prev-month,.next-month,.week') &&
+      (!el.matches('.ant-picker-cell') || el.classList.contains('ant-picker-cell-in-view')) && !!clean(el.textContent));
+  }
+  function cellTarget(cell) { return q('.ant-picker-cell-inner,.el-date-table-cell__text,.cell', cell) || cell; }
+  function confirmButton(popup) {
+    return qa('.ant-picker-ok button,.el-picker-panel__link-btn,.el-time-panel__btn.confirm', popup).find(el => visible(el) && !disabled(el) && /^(确定|确认|OK|Confirm)$/i.test(clean(el.textContent).replace(/\s+/g, '')));
+  }
+  async function chooseTime(s, popup, random) {
+    const timeInputs = qa('.el-date-picker__time-header input,.el-date-range-picker__time-header input', popup).filter(el => visible(el) && !disabled(el) && /^\d{2}:\d{2}/.test(el.value));
+    for (const input of timeInputs) {
+      componentAlive(s); input.dispatchEvent(new FocusEvent('focus', { bubbles: false }));
+      const panel = await componentWait(s, () => qa('.el-time-panel', popup).find(visible), '时间面板未打开');
+      await chooseTimeColumns(s, panel, random);
+      const confirm = confirmButton(panel);
+      if (!confirm) throw new Error('时间尚未达到可确认状态');
+      pointerClick(confirm);
+      await componentWait(s, () => !panel.isConnected || !visible(panel), '时间面板未关闭');
+    }
+    if (!timeInputs.length) await chooseTimeColumns(s, popup, random);
+  }
+  async function chooseTimeColumns(s, popup, random) {
+    for (const selector of ['.ant-picker-time-panel-column', '.el-time-spinner__wrapper']) {
+      const columns = qa(selector, popup).filter(visible);
+      for (const column of columns) {
+        componentAlive(s);
+        const choices = qa('.ant-picker-time-panel-cell,.el-time-spinner__item', column).filter(el => visible(el) && !disabled(el) && !el.matches('.ant-picker-time-panel-cell-disabled,.is-disabled') && /^\d/.test(clean(el.textContent)));
+        if (!choices.length) throw new Error('时间列没有可选值');
+        pointerClick(choices[Math.floor(random() * choices.length)]); await sleep(100);
+      }
+    }
+  }
+  async function setPicker(f, desired) {
+    const s = componentSession(f), before = read(f), inputs = pickerInputs(f.el), wanted = desired?.auto ? null : desired;
+    if (!inputs.length || inputs.length > 2) throw new Error('日期组件输入结构暂不支持');
+    if (wanted && (!Array.isArray(wanted) || (wanted.length && wanted.length !== inputs.length))) throw new Error('日期范围需要开始和结束两个值，以逗号分隔');
+    try {
+      if (wanted && !wanted.length) { await clearComponent(s); return; }
+      if (wanted && same(before, wanted)) return;
+      let popup = await openComponent(s);
+      if (wanted && inputs.length === 2 && f.el.matches('.el-date-editor')) {
+        // Element range change commits both endpoints together. Updating one endpoint
+        // first can be rejected against the old opposite endpoint.
+        for (let i = 0; i < inputs.length; i++) {
+          componentAlive(s);
+          setNative(inputs[i], 'value', wanted[i]);
+          inputs[i].dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          await sleep(80);
+        }
+        componentKey(inputs[1], 'Enter');
+        await sleep(150);
+      } else if (wanted) {
+        for (let i = 0; i < inputs.length; i++) {
+          componentAlive(s);
+          const input = pickerInputs(f.el)[i];
+          if (i) popup = await openComponent(s, i);
+          // Popup-only inputs still expose the component's input/change handlers.
+          // Opening the picker above verifies that the component itself is editable.
+          input.focus({ preventScroll: true }); setNative(input, 'value', wanted[i]);
+          input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          await sleep(100); // Let controlled inputs render before committing.
+          input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          componentKey(input, 'Enter'); await sleep(150); input.blur();
+        }
+      } else {
+        const random = rng(`${desired.seed}:${f.key}`);
+        // Pick through the calendar so locale, format and disabledDate remain authoritative.
+        for (let selection = 0; selection < 6; selection++) {
+          componentAlive(s); popup = ownedPopup(s);
+          if (!popup) break;
+          const cells = calendarCells(popup);
+          if (cells.length) {
+            const alternative = cells.filter(el => !el.matches('.ant-picker-cell-selected,.current,.start-date,.end-date'));
+            const choices = alternative.length ? alternative : cells;
+            pointerClick(cellTarget(choices[Math.floor(random() * choices.length)])); await sleep(150);
+          }
+          popup = ownedPopup(s);
+          if (!popup) break;
+          // Only commit time after the date (both endpoints for a range) is chosen.
+          if (!cells.length || inputs.length === 1 || selection >= 1) {
+            await chooseTime(s, popup, random);
+            const confirm = confirmButton(popup);
+            if (confirm) {
+              pointerClick(confirm); await sleep(150);
+              if (read(f).length === inputs.length && read(f).every(Boolean)) break;
+            }
+          }
+          if (!cells.length) break;
+        }
+      }
+      popup = ownedPopup(s);
+      const confirm = popup && confirmButton(popup);
+      if (confirm) { pointerClick(confirm); await sleep(150); }
+      await closeComponent(s);
+      await componentWait(s, () => { const values = read(f); return values.length === inputs.length && values.every(Boolean) && (!wanted || same(values, wanted)); }, '日期未提交或被页面重置，请检查格式和可选范围');
+      await sleep(150);
+      if (wanted && !same(read(f), wanted)) throw new Error('日期值未保持');
+    } finally { await closeComponent(s); }
+  }
+  function hierarchyValues(el) {
+    const tags = qa('.ant-select-selection-item,.el-tag__content,.el-cascader__tags .el-tag > span', el).filter(visible).map(n => clean(n.getAttribute('title') || n.textContent)).filter(Boolean);
+    if (tags.length) return [...new Set(tags)];
+    const antValue = q('.ant-select-content-has-value', el);
+    if (antValue && !el.matches('.ant-select-multiple')) return [clean(antValue.getAttribute('title') || antValue.textContent)].filter(Boolean);
+    const selected = qa('.el-select__selected-item:not(.is-transparent),.ant-select-content-value', el).find(n => !q('input', n) && visible(n) && clean(n.textContent));
+    if (selected && !el.classList.contains('is-empty')) return [clean(selected.textContent)];
+    const input = q('input', el);
+    return input?.value ? [clean(input.value)] : [];
+  }
+  function hierarchyColumns(popup) { return qa('.ant-cascader-menu,.el-cascader-menu', popup).filter(visible); }
+  function hierarchyNodes(popup, kind, depth = 0, parent = null) {
+    if (kind === 'cascader') {
+      const column = hierarchyColumns(popup)[depth];
+      return column ? qa('.ant-cascader-menu-item,.el-cascader-node', column).filter(visible) : [];
+    }
+    const nodes = qa('.ant-select-tree-treenode,.el-tree-node', popup).filter(visible);
+    if (nodes.some(n => n.matches('.el-tree-node'))) return nodes.filter(n => n.parentElement.closest('.el-tree-node') === parent);
+    // Ant tree nodes are flat DOM rows; indentation exposes their hierarchy.
+    const level = n => qa('.ant-select-tree-indent-unit', n).length;
+    if (!parent) return nodes.filter(n => level(n) === 0);
+    const start = nodes.indexOf(parent);
+    if (start < 0) return [];
+    const siblings = nodes.slice(start + 1), end = siblings.findIndex(n => level(n) < depth);
+    return (end < 0 ? siblings : siblings.slice(0, end)).filter(n => level(n) === depth);
+  }
+  function nodeLabel(node) { return clean((q('.ant-cascader-menu-item-content,.el-cascader-node__label,.ant-select-tree-title,:scope > .el-tree-node__content .el-select-dropdown__item,:scope > .el-tree-node__content .el-tree-node__label', node) || node).textContent); }
+  function nodeDisabled(node) { return disabled(node) || node.matches('.ant-cascader-menu-item-disabled,.ant-select-tree-treenode-disabled,.is-disabled') || !!q(':scope > .el-tree-node__content .el-checkbox.is-disabled,:scope > .el-checkbox.is-disabled,:scope > .ant-select-tree-checkbox-disabled', node); }
+  function nodeBranch(node, kind) {
+    if (kind === 'cascader') return !!q('.ant-cascader-menu-item-expand,.ant-cascader-menu-item-expand-icon,.el-cascader-node__postfix', node) || node.getAttribute('aria-haspopup') === 'true';
+    const expand = q('.ant-select-tree-switcher,.el-tree-node__expand-icon', node);
+    return !!expand && !expand.matches('.ant-select-tree-switcher-noop,.is-leaf');
+  }
+  async function expandNode(s, node) {
+    const target = s.f.kind === 'tree' ? q('.ant-select-tree-switcher,.el-tree-node__expand-icon', node) : q('.el-cascader-node__label,.ant-cascader-menu-item-content', node) || node;
+    if (!target) throw new Error('无法展开此节点');
+    target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    node.dispatchEvent(new MouseEvent('mouseenter', { bubbles: false }));
+    if (!(s.f.kind === 'tree' && (node.getAttribute('aria-expanded') === 'true' || node.matches('.is-expanded') || target.matches('.ant-select-tree-switcher_open')))) pointerClick(target);
+    await sleep(100);
+    await componentWait(s, () => !node.matches('.ant-cascader-menu-item-loading') && !q('.is-loading,.ant-select-tree-switcher-loading-icon', node) && (s.f.kind !== 'cascader' || node.matches('.ant-cascader-menu-item-active,[aria-expanded="true"]')), '下级选项加载超时');
+  }
+  async function hierarchyPaths(s) {
+    const leaves = [], branches = []; let visited = 0;
+    async function walk(depth, path, parent) {
+      if (depth >= 16) throw new Error('选项层级超出自动遍历范围');
+      const popup = ownedPopup(s); if (!popup) throw new Error('选择面板意外关闭');
+      const names = hierarchyNodes(popup, s.f.kind, depth, parent).filter(n => !nodeDisabled(n)).map(nodeLabel);
+      for (const name of names) {
+        componentAlive(s);
+        if (++visited > 300) throw new Error('选项数量超出自动遍历范围');
+        const matches = hierarchyNodes(popup, s.f.kind, depth, parent).filter(n => nodeLabel(n) === name && !nodeDisabled(n));
+        if (matches.length !== 1) throw new Error('同层存在重名选项，请增加可区分名称');
+        const node = matches[0], nextPath = [...path, name];
+        if (!nodeBranch(node, s.f.kind)) { leaves.push(nextPath); continue; }
+        branches.push(nextPath);
+        await expandNode(s, node);
+        await componentWait(s, () => hierarchyNodes(popup, s.f.kind, depth + 1, s.f.kind === 'tree' ? node : null).length, `“${name}”的下级选项未加载`);
+        await walk(depth + 1, nextPath, s.f.kind === 'tree' ? node : null);
+        // Collapse Ant's flat rows before walking another branch with the same depth.
+        if (s.f.kind === 'tree' && node.matches('.ant-select-tree-treenode')) { pointerClick(q('.ant-select-tree-switcher', node)); await sleep(80); }
+      }
+    }
+    await componentWait(s, () => { const popup = ownedPopup(s); return popup && hierarchyNodes(popup, s.f.kind).length; }, '暂无可选项或选项尚未加载');
+    await walk(0, [], null); return { leaves, branches };
+  }
+  async function selectHierarchyPath(s, path) {
+    let parent = null;
+    for (let depth = 0; depth < path.length; depth++) {
+      componentAlive(s);
+      const popup = ownedPopup(s) || await openComponent(s);
+      const nodes = await componentWait(s, () => { const nodes = hierarchyNodes(popup, s.f.kind, depth, parent); return nodes.length && nodes; }, '下级选项未加载');
+      const matches = nodes.filter(n => nodeLabel(n) === path[depth] && !nodeDisabled(n));
+      if (matches.length !== 1) throw new Error(`选项“${path[depth]}”缺失、禁用或不唯一`);
+      const node = matches[0];
+      if (depth < path.length - 1) { await expandNode(s, node); parent = s.f.kind === 'tree' ? node : null; }
+      else {
+        const checkbox = q(':scope > .ant-cascader-checkbox,:scope > .el-checkbox .el-checkbox__input,:scope > .ant-select-tree-checkbox,:scope > .el-tree-node__content .el-checkbox__input', node);
+        pointerClick(checkbox || q('.ant-select-tree-node-content-wrapper,.el-tree-node__content,.el-cascader-node__label,.ant-cascader-menu-item-content', node) || node);
+        await sleep(150);
+      }
+    }
+  }
+  async function setHierarchy(f, desired) {
+    const s = componentSession(f), before = read(f), wanted = desired?.auto ? null : desired;
+    if (wanted && (!Array.isArray(wanted) || !wanted.every(v => typeof v === 'string'))) throw new Error('级联选项格式错误');
+    try {
+      if (wanted && !wanted.length) { await clearComponent(s); return; }
+      if (wanted && same(before, wanted)) return;
+      await openComponent(s);
+      const { leaves, branches } = await hierarchyPaths(s), catalog = [...leaves, ...branches];
+      if (!leaves.length) throw new Error('没有可选的末级选项');
+      const displayKey = text => text.split(/\s*\/\s*/).join('/');
+      let paths;
+      if (wanted) paths = wanted.map(text => {
+        const matches = catalog.filter(path => displayKey(path.join('/')) === displayKey(text) || path.at(-1) === text);
+        if (matches.length !== 1) throw new Error(`选项“${text}”缺失或有歧义，请填写完整路径（上级 / 下级）`);
+        return matches[0];
+      });
+      else {
+        const different = leaves.filter(p => !before.some(v => displayKey(v) === displayKey(p.join('/')) || v === p.at(-1)));
+        const pool = different.length ? different : leaves;
+        paths = [pool[Math.floor(rng(`${desired.seed}:${f.key}`)() * pool.length)]];
+      }
+      // Libraries can collapse fully checked children into a parent tag. Compare
+      // the represented leaf sets so the default SHOW_PARENT display also works.
+      const represented = selected => [...new Set(selected.flatMap(path => leaves.filter(leaf => path.every((name, i) => leaf[i] === name)).map(path => path.join('/'))))].sort();
+      const expected = represented(paths);
+      if (!expected.length) throw new Error('选中路径没有可用的末级项');
+      paths = paths.filter((path, i) => paths.findIndex(other => same(path, other)) === i);
+      const popup = ownedPopup(s), multiple = multiCombo(f.el) || !!q('.ant-cascader-checkbox,.el-cascader-node .el-checkbox,.ant-select-tree-checkbox,.el-tree-node .el-checkbox', popup);
+      if (!multiple && paths.length > 1) throw new Error('当前组件不支持多选');
+      if (multiple && before.length) { await closeComponent(s); await clearComponent(s); await openComponent(s); }
+      for (const path of paths) { if (!ownedPopup(s)) await openComponent(s); await selectHierarchyPath(s, path); }
+      await closeComponent(s);
+      await componentWait(s, () => {
+        const selected = read(f).map(text => catalog.filter(path => (displayKey(path.join('/')) === displayKey(text) || path.at(-1) === text) && represented([path]).every(key => expected.includes(key))));
+        return selected.every(matches => matches.length === 1) && same(represented(selected.map(matches => matches[0])), expected);
+      }, '组件选择未提交，或显示格式无法核对');
+    } finally { await closeComponent(s); }
+  }
   async function write(f, value, restoring = false) {
     if (f.reason) throw new Error(f.reason);
+    if (f.kind === 'picker') return setPicker(f, value);
+    if (f.kind === 'cascader' || f.kind === 'tree') return setHierarchy(f, value);
     if (f.kind === 'combo') return setCombo(f, value);
     if (f.kind === 'radio') {
       if (!value) {
@@ -1012,6 +1296,7 @@
     reports.push({ label, status, message, descriptor }); renderReports();
   }
   function parseFixed(f, value) {
+    if (['picker', 'cascader', 'tree'].includes(f.kind)) return value.replace(/\{date\}/g, new Date().toLocaleDateString('sv-SE')).replace(/\{seed\}/g, ui.seed.value).replace(/\{timestamp\}/g, String(Date.now())).split(/[,，\n]|\s*~\s*/).map(clean).filter(Boolean);
     if (f.kind === 'checkbox' || f.kind === 'switch') {
       if (/^(true|1|是|开|选中)$/i.test(value.trim())) return true;
       if (/^(false|0|否|关|未选中)$/i.test(value.trim())) return false;
@@ -1241,12 +1526,12 @@
     if (!t || !str(t.name, 120) || !t.page || !str(t.page.origin) || !/^https?:\/\//.test(t.page.origin) || !str(t.page.path) || !Array.isArray(t.fields) || t.fields.length > 500) throw new Error('模板结构不合法');
     const fields = t.fields.map(entry => {
       const d = entry?.descriptor;
-      if (!d || !['text', 'textarea', 'number', 'date', 'select', 'combo', 'radio', 'checkbox', 'switch'].includes(d.kind)) throw new Error('模板包含不支持的字段类型');
+      if (!d || !['text', 'textarea', 'number', 'date', 'select', 'combo', 'picker', 'cascader', 'tree', 'radio', 'checkbox', 'switch'].includes(d.kind)) throw new Error('模板包含不支持的字段类型');
       const descriptor = {};
       for (const key of ['kind', 'type', 'name', 'id', 'testid', 'label', 'context', 'placeholder']) { if (!str(d[key] ?? '')) throw new Error('字段标识过长'); descriptor[key] = d[key] || ''; }
       const v = entry.value;
       if (d.kind === 'checkbox' || d.kind === 'switch') { if (typeof v !== 'boolean') throw new Error('布尔值格式错误'); }
-      else if (d.kind === 'combo') { if (!Array.isArray(v) || v.length > 100 || !v.every(x => str(x))) throw new Error('组件选项格式错误'); }
+      else if (['combo', 'picker', 'cascader', 'tree'].includes(d.kind)) { if (!Array.isArray(v) || v.length > (d.kind === 'picker' ? 2 : 100) || !v.every(x => str(x))) throw new Error('组件选项格式错误'); }
       else if (d.kind === 'select' || d.kind === 'radio') {
         const list = d.kind === 'select' ? v : v == null ? [] : [v];
         if (!Array.isArray(list) || list.length > 100 || !list.every(x => x && str(x.value) && str(x.text))) throw new Error('选项格式错误');
@@ -1430,7 +1715,7 @@
             <button class="action tint full" id="saveSettings">保存生成偏好</button>
           </div></details>
 
-          <details class="section-card" id="fieldDetails"><summary><span class="section-icon teal" aria-hidden="true">☷</span><span class="summary-copy"><strong>单项设置</strong><small>为特定字段单独设置生成方式</small></span><span class="count-pill" id="fieldCount"></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="help">可以设置随机范围、文本库、固定值，或跳过某一项。右键字段旁的随机按钮可直接找到它。</div><div class="reason" id="ruleHint" hidden></div><div id="fields"></div><button class="action tint full" id="saveRules">保存单项设置</button><details class="inset-details"><summary>固定值怎么填写<span class="chevron" aria-hidden="true"></span></summary><div class="inset-body help">支持 {date}、{seed}、{timestamp}。下拉填写选项文字；多选用逗号分隔；开关填写 true / false。</div></details></div></details>
+          <details class="section-card" id="fieldDetails"><summary><span class="section-icon teal" aria-hidden="true">☷</span><span class="summary-copy"><strong>单项设置</strong><small>为特定字段单独设置生成方式</small></span><span class="count-pill" id="fieldCount"></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="help">可以设置随机范围、文本库、固定值，或跳过某一项。右键字段旁的随机按钮可直接找到它。</div><div class="reason" id="ruleHint" hidden></div><div id="fields"></div><button class="action tint full" id="saveRules">保存单项设置</button><details class="inset-details"><summary>固定值怎么填写<span class="chevron" aria-hidden="true"></span></summary><div class="inset-body help">支持 {date}、{seed}、{timestamp}。下拉填写选项文字；级联重名时填写“上级 / 下级”；多选和日期范围用逗号分隔；日期按页面格式；开关填写 true / false。</div></details></div></details>
           <details class="section-card" id="reportDetails"><summary><span class="section-icon blue" aria-hidden="true">✓</span><span class="summary-copy"><strong>填写记录</strong><small id="reportHint">查看本次填写结果</small></span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body"><div class="stats" id="stats"></div><div id="results"><div class="empty-state">开始填写后，结果会显示在这里。</div></div></div></details>
           <details class="section-card templates-card" id="templateDetails"><summary><span class="section-icon amber" aria-hidden="true">▤</span><span class="summary-copy"><strong>我的模板</strong><small>保存一套填写，下次直接复用</small></span><span class="count-pill" id="templateCount">0 份</span><span class="chevron" aria-hidden="true"></span></summary><div class="section-body">
             <div id="emptyTemplates" class="empty-state" hidden>还没有模板。填好表单后，把这套内容保存下来吧。</div>

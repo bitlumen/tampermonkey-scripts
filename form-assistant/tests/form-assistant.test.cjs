@@ -502,8 +502,8 @@ test('Ant Design and Element Plus wrapper inputs count as one control for custom
   const content = '<div id="editor"><div><h2>核算范围</h2></div><div><div><div>核算类型</div><div class="ant-select"><div class="ant-select-content"><span>归档</span><input role="combobox" type="search" id="«r1r»" readonly></div></div></div><div><div>周期类型</div><div class="el-select"><input role="combobox" readonly id="el-id-234"></div></div><div><div>年份</div><div class="ant-picker"><div class="ant-picker-input"><input readonly placeholder="请选择年份"></div></div></div></div></div>';
   const env = await setup(t, { content, store: { [INLINE]: true } }), page = await env.openPage();
   assert.deepEqual(await fieldNames(page), ['核算类型', '周期类型', '年份']);
-  await page.locator('#tfa-host-v1 .field-dice').first().waitFor(); assert.equal(await page.locator('#tfa-host-v1 .field-dice').count(), 2);
-  assert.match(await row(page, '年份').locator('.reason').first().textContent(), /需手动处理/);
+  await page.locator('#tfa-host-v1 .field-dice').first().waitFor(); assert.equal(await page.locator('#tfa-host-v1 .field-dice').count(), 3);
+  assert.equal(await row(page, '年份').locator('.reason:not(.rule-warning)').count(), 0);
 });
 
 test('a completely anonymous single control fills and keeps its rule local instead of saving an unusable template', async t => {
