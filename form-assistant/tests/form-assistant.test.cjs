@@ -474,6 +474,31 @@ test('a reused DOM node with a changed business label is not written after async
   assert.deepEqual(await values(page), ['原文']); assert.match(await ctl(page, 'results').textContent(), /标签或用途已变化/);
 });
 
+test('numeric verification accepts equivalent decimals without hiding rounding, empty values or precision loss', async t => {
+  const cases = [
+    ['12.34', '0012.3400', true], ['0.5', '5e-1', true], ['0', '-0.0000', true],
+    ['9007199254740993', '9007199254740993.00', true],
+    ['9007199254740993', '9007199254740992', false], ['0', '', false],
+    ['1.2345', '1.23', false], ['1000', '1,000', false],
+  ];
+  const content = `<form id="editor">${cases.map((_, i) => `<label>数值${i}<input name="decimal${i}" role="spinbutton"></label>`).join('')}</form>`;
+  const env = await setup(t, { content }), page = await env.openPage(); await settings(page); await expand(page, 'fieldDetails');
+  for (let i = 0; i < cases.length; i++) {
+    await row(page, `数值${i}`).locator('.mode').selectOption('fixed');
+    await row(page, `数值${i}`).locator('.fixed').fill(cases[i][0]);
+  }
+  await page.evaluate(cases => {
+    document.querySelectorAll('#editor input').forEach((el, i) => el.addEventListener('change', () => { el.value = cases[i][1]; }));
+  }, cases);
+  await run(page);
+  const reported = await ctl(page, 'results').locator('.result').evaluateAll(nodes => nodes.map(n => ({ text: n.textContent, status: n.className })));
+  for (let i = 0; i < cases.length; i++) {
+    const result = reported.find(r => r.text.startsWith(`数值${i} —`));
+    assert.match(result.status, cases[i][2] ? /ok/ : /fail/, result.text);
+  }
+  assert.equal(await ctl(page, 'stats').textContent(), '成功 4 · 跳过 0 · 检查 0 · 失败 4');
+});
+
 test('legacy generated form IDs retain rules and generation preferences when moving to a stable scope', async t => {
   const desc = oldDescriptor({ kind: 'text', type: 'text', name: 'title', label: '标题', placeholder: '' });
   const store = oldDatabase({ [oldKey(desc)]: { mode: 'fixed', value: '旧规则' } }, [], '«r2a»');

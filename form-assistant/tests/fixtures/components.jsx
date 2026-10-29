@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ConfigProvider, DatePicker, TimePicker, Cascader, TreeSelect } from 'antd';
+import { ConfigProvider, DatePicker, TimePicker, Cascader, TreeSelect, InputNumber, Radio, Form } from 'antd';
 import antZh from 'antd/locale/zh_CN';
 import dayjs from 'dayjs';
 import { createApp, h, ref } from 'vue';
@@ -22,7 +22,30 @@ const initialDate = value => Array.isArray(value) ? value.map(dayjs) : value ? d
 window.changes = []; window.submitted = false; window.lazyLoads = [];
 document.addEventListener('submit', e => { e.preventDefault(); window.submitted = true; });
 
-if (library === 'ant') {
+if (kind === 'energy') {
+  function EnergyFixture() {
+    const [mode, setMode] = useState('standard');
+    const [amounts, setAmounts] = useState({});
+    const names = ['净购入火电', '天然气', '石油', '煤炭'];
+    const units = ['万千瓦时', '万立方米', '吨', '吨'];
+    const change = (key, value) => {
+      window.changes.push({ key, value });
+      setAmounts(previous => ({ ...previous, [key]: config.resetNumbers && value != null ? 7 : value }));
+    };
+    return <Form id="editor"><h2>能源活动下达目标</h2>
+      <Radio.Group aria-label="计算方式" name="method" value={mode} onChange={event => { setMode(event.target.value); window.changes.push({ mode: event.target.value }); }}>
+        <Radio value="standard">折标量核算法</Radio><Radio value="physical">实物量核算法</Radio>
+      </Radio.Group>
+      <table><thead><tr><th rowSpan={2}>地区</th><th colSpan={4}>{mode === 'standard' ? '折标量' : '实物量'}</th><th rowSpan={2}>非化石能源消耗占比（%）</th></tr><tr>{names.map((name, i) => <th key={name}>{name}（{mode === 'standard' ? '吨标准煤' : units[i]}）</th>)}</tr></thead>
+        <tbody>{['甲区', '乙区'].map((region, r) => <tr key={region}><th scope="row">{region}</th>{names.map((name, i) => {
+          const key = `${r}-${i}`;
+          return <td key={key}><InputNumber id={`energy-${key}`} aria-label={`${region} ${name}（${mode === 'standard' ? '吨标准煤' : units[i]}）`} placeholder="请输入" controls={false} precision={4} step={0.0001} value={amounts[key]} onChange={value => change(key, value)} /></td>;
+        })}<td><InputNumber id={`share-${r}`} aria-label={`${region} 非化石能源消耗占比（%）`} placeholder="请输入" controls={false} min={0} max={100} precision={2} step={0.01} value={amounts[`share-${r}`]} onChange={value => change(`share-${r}`, value)} /></td></tr>)}</tbody>
+      </table><output id="model">{JSON.stringify({ mode, amounts })}</output><button type="submit">保存</button>
+    </Form>;
+  }
+  createRoot(document.getElementById('fixture')).render(<EnergyFixture />);
+} else if (library === 'ant') {
   function Fixture() {
     const [value, setValue] = useState(hierarchy ? initial : initialDate(initial));
     const [data, setData] = useState(() => lazy ? options().map(({ children, ...node }) => ({ ...node, isLeaf: false })) : options());

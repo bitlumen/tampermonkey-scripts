@@ -46,6 +46,85 @@ async function fixed(page, value) {
   const field = page.locator('#tfa-host-v1 .field').filter({ has: page.getByText('测试字段', { exact: true }) });
   await field.locator('.mode').selectOption('fixed'); await field.locator('.fixed').fill(value);
 }
+async function energyRule(page, label, mode, value) {
+  await ctl(page, 'fieldDetails').evaluate(n => { n.open = true; });
+  const field = page.locator('#tfa-host-v1 .field').filter({ has: page.getByText(label, { exact: true }) });
+  await field.locator('.mode').selectOption(mode);
+  if (value != null) await field.locator('.fixed').fill(value);
+}
+
+for (const action of ['quickFill', 'fill']) {
+  test(`Ant energy table: ${action} replans reused pending inputs after calculation mode changes`, async t => {
+    const page = await setup(t, { library: 'ant', kind: 'energy' });
+    await page.evaluate(() => { window.originalEnergy = document.getElementById('energy-0-0'); });
+    await energyRule(page, '计算方式', 'fixed', '实物量核算法');
+    if (action === 'fill') await ctl(page, 'overwrite').check();
+    await run(page, action);
+    const value = await model(page);
+    assert.equal(value.mode, 'physical');
+    assert.equal(await page.evaluate(() => window.originalEnergy === document.getElementById('energy-0-0')), true);
+    assert.equal(Object.keys(value.amounts).length, 10, await results(page));
+    assert(Object.values(value.amounts).every(n => typeof n === 'number' && Number.isFinite(n)));
+    assert.equal(await ctl(page, 'stats').textContent(), '成功 11 · 跳过 0 · 检查 0 · 失败 0', await results(page));
+    assert.match(await results(page), /甲区 净购入火电（万千瓦时）/);
+    assert.equal(await page.evaluate(() => window.submitted), false);
+    await run(page, 'undo');
+    assert.equal((await model(page)).mode, 'standard');
+    assert(Object.values((await model(page)).amounts).every(n => n == null), await results(page));
+  });
+}
+
+test('Ant energy table does not transfer fixed rules across units or refill a repurposed template entry', async t => {
+  const page = await setup(t, { library: 'ant', kind: 'energy' });
+  await energyRule(page, '计算方式', 'skip');
+  await energyRule(page, '甲区 净购入火电（吨标准煤）', 'fixed', '12.3400');
+  await run(page); // Keep the initial calculation mode for the template.
+  await energyRule(page, '计算方式', 'fixed', '实物量核算法');
+  await run(page);
+  assert.match(await results(page), /甲区 净购入火电（吨标准煤） — 控件标签或用途已变化/);
+  const assignments = await page.evaluate(() => window.changes);
+  const switched = assignments.findLastIndex(change => change.mode === 'physical');
+  assert(!assignments.slice(switched + 1).some(change => change.key === '0-0'), JSON.stringify(assignments));
+
+  await ctl(page, 'templateDetails').evaluate(n => { n.open = true; });
+  await ctl(page, 'save').click();
+  await page.waitForFunction(() => JSON.parse(window.gm['tfa.database.v1']).templates.length === 1);
+  // Store a template whose upstream choice changes the unit of its downstream entries.
+  await page.evaluate(() => {
+    const db = JSON.parse(window.gm['tfa.database.v1']);
+    db.templates[0].fields.find(f => f.descriptor.kind === 'radio').value = { value: 'standard', text: '折标量核算法' };
+    window.gm['tfa.database.v1'] = JSON.stringify(db);
+  });
+  // Reinitialize in a fresh page so the userscript reads the saved template normally.
+  const store = await page.evaluate(() => window.gm);
+  await page.reload();
+  await page.evaluate(store => { window.gm = store; }, store);
+  await page.locator('#energy-0-0').waitFor();
+  await page.getByRole('radio', { name: '实物量核算法', exact: true }).check();
+  await page.addScriptTag({ content: script });
+  await ctl(page, 'launcher').click(); await ctl(page, 'openSettings').click();
+  await ctl(page, 'templateDetails').evaluate(n => { n.open = true; });
+  await ctl(page, 'overwrite').check(); await run(page, 'replay');
+  assert.equal((await model(page)).mode, 'standard');
+  assert.equal((await model(page)).amounts['0-0'], undefined, await results(page));
+  assert.match(await results(page), /标签或用途已变化/);
+});
+
+test('Ant numeric precision padding is accepted, but an actual value reset still fails', async t => {
+  for (const resetNumbers of [false, true]) {
+    const page = await setup(t, { library: 'ant', kind: 'energy', resetNumbers });
+    await energyRule(page, '计算方式', 'skip');
+    await energyRule(page, '甲区 净购入火电（吨标准煤）', 'fixed', '12.34');
+    await energyRule(page, '甲区 非化石能源消耗占比（%）', 'fixed', '0.5');
+    await run(page);
+    assert.equal((await model(page)).amounts['0-0'], resetNumbers ? 7 : 12.34);
+    assert.equal(await page.locator('#energy-0-0').inputValue(), resetNumbers ? '7.0000' : '12.3400');
+    assert.equal(await page.locator('#share-0').inputValue(), resetNumbers ? '7.00' : '0.50');
+    if (resetNumbers) assert.match(await results(page), /甲区 净购入火电（吨标准煤） — 值被页面重置或转换/);
+    else assert.equal(await ctl(page, 'stats').textContent(), '成功 10 · 跳过 1 · 检查 0 · 失败 0', await results(page));
+  }
+});
+
 for (const library of ['ant', 'el']) {
   test(`${library} Chinese datetime confirmation commits the selected value`, async t => {
     const page = await setup(t, { library, kind: 'datetime', chinese: true, readonly: true });

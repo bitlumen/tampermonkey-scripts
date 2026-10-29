@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         系统测试填表助手
 // @namespace    https://github.com/bitlumen
-// @version      1.3.0
+// @version      1.3.1
 // @description  三段快捷条：整表重填、填表设置、全局单项随机；支持模板、文本库与生成偏好。本地及局域网默认显示。
 // @author       enthem
 // @match        http://*/*
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
   if (document.getElementById('tfa-host-v1')) return;
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
   const STORAGE = 'tfa.database.v1';
   const SITE_STORAGE = 'tfa.site-visibility.v1';
   const LIBRARY_STORAGE = 'tfa.text-library.v1';
@@ -577,6 +577,39 @@
     if (!reference.unique) return { reason: '原同名控件已被替换，无法确认对应关系' };
     // A replacement node is safe only when its saved features identify one field.
     return matchField(reference.descriptor, candidates);
+  }
+
+  function replanDependentFields(pending, before, after) {
+    const previous = new Map(before.map(f => [f.el, f])), current = new Map(after.map(f => [f.el, f]));
+    for (const task of pending) {
+      const old = previous.get(task.entry.element), next = current.get(task.entry.element);
+      // Replan only untouched, uniquely identified automatic tasks changed by our
+      // upstream choice. Never carry a fixed value or a per-field rule across units.
+      if (!old || !next || !old.unique || !next.unique || old.reason || next.reason ||
+        !same(old.desc, task.entry.descriptor) || same(old.desc, next.desc)) continue;
+      const oldRule = ruleFor(old), nextRule = ruleFor(next);
+      if (old.ruleBlocked || next.ruleBlocked || oldRule.mode !== 'auto' || nextRule.mode !== 'auto') continue;
+      Object.assign(task.entry, liveReference(next));
+    }
+  }
+
+  function sameFieldValue(f, actual, expected) {
+    if (same(actual, expected)) return true;
+    if (f.kind !== 'number') return false;
+    const decimalKey = value => {
+      // Compare decimal values exactly: padding and exponent notation may change,
+      // but rounding, empty values and integers beyond Number precision must not pass.
+      const match = /^([+-]?)(\d+(?:\.\d*)?|\.\d+)(?:e([+-]?\d+))?$/i.exec(String(value ?? '').trim());
+      if (!match) return null;
+      const fraction = (match[2].split('.')[1] || '').length;
+      const digits = match[2].replace('.', '').replace(/^0+/, '');
+      if (!digits) return '0';
+      const significant = digits.replace(/0+$/, '');
+      const exponent = BigInt(match[3] || '0') - BigInt(fraction) + BigInt(digits.length - significant.length);
+      return `${match[1] === '-' ? '-' : ''}${significant}e${exponent}`;
+    };
+    const key = decimalKey(actual);
+    return key !== null && key === decimalKey(expected);
   }
 
   function rng(seed) {
@@ -1272,7 +1305,7 @@
       if (!same(actual.map(v => v.text).sort(), expected)) throw new Error('选中结果未保持');
     } else if (f.kind === 'radio') {
       if ((value?.text ?? null) !== (actual?.text ?? null)) throw new Error('单选值未保持');
-    } else if (!same(actual, f.kind === 'number' ? String(value) : value)) throw new Error('值被页面重置或转换，请检查业务规则');
+    } else if (!sameFieldValue(f, actual, f.kind === 'number' ? String(value) : value)) throw new Error('值被页面重置或转换，请检查业务规则');
   }
   function validationMessage(el) {
     const v = el.validity;
@@ -1333,7 +1366,12 @@
       historyPage = startPage; historyRoot = startRoot;
       // Quick refill uses a new batch seed without changing the reproducibility setting.
       const seed = mode === 'refresh' ? `${ui.seed.value || '1'}:${uid()}` : ui.seed.value || '1';
-      const entries = mode === 'template' ? template.fields : fields.map(liveReference);
+      const entries = mode === 'template' ? template.fields.map(entry => {
+        const matched = matchField(entry.descriptor, fields).field;
+        // Resolve legacy template identities once, then retain the same live
+        // meaning checks as generated tasks if an upstream value changes labels.
+        return matched ? { ...entry, ...liveReference(matched) } : { ...entry };
+      }) : fields.map(liveReference);
       const done = new Set(), planned = entries.slice();
       const pending = entries.map(entry => ({ entry }));
       const successes = [];
@@ -1360,7 +1398,8 @@
           try {
             const value = mode === 'template' ? entry.value : rule.mode === 'fixed' ? parseFixed(f, rule.value) : mode === 'refresh' ? await generateDifferent(f, before, seed) : await generate(f, seed);
             if (cancelled || pageKey() !== startPage || !f.el.isConnected || rootScope() !== startRoot) throw new Error('页面已变化或操作已停止，未写入');
-            if (!matchLive(liveReference(f), collect(startRoot)).field) throw new Error('生成期间控件标签或用途已变化，未写入');
+            const beforeWrite = collect(startRoot);
+            if (!matchLive(liveReference(f), beforeWrite).field) throw new Error('生成期间控件标签或用途已变化，未写入');
             if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
             // Capture before touching the control, including attempts that partially fail.
             const snapshot = { ...liveReference(f), value: before, after: undefined };
@@ -1370,6 +1409,10 @@
             const error = fieldError(f);
             report(f.label, error ? 'warn' : 'ok', error || '已填写并核对显示值', f.desc);
             successes.push({ ...liveReference(f), value: read(f), reportIndex: reports.length - 1 }); done.add(f.uid);
+            if (mode !== 'template' && !error && !cancelled && pageKey() === startPage && startRoot.isConnected && rootScope() === startRoot &&
+              ['radio', 'select', 'combo', 'checkbox', 'switch', 'picker', 'cascader', 'tree'].includes(f.kind) && !same(read(f), before)) {
+              replanDependentFields(pending, beforeWrite, collect(startRoot));
+            }
           } catch (err) {
             if (pass < 2 && /暂无可选项/.test(err.message)) pending.push(task);
             else { report(f.label, 'fail', err.message, f.desc); done.add(f.uid); }
@@ -1391,7 +1434,7 @@
         const latest = collect(startRoot);
         for (const result of successes) {
           const f = matchLive(result, latest).field;
-          const error = f ? fieldError(f) || (!same(read(f), result.value) ? '后续联动改变了此字段，请检查' : '') : '字段在联动后消失';
+          const error = f ? fieldError(f) || (!sameFieldValue(f, read(f), result.value) ? '后续联动改变了此字段，请检查' : '') : '字段在联动后消失';
           if (error) Object.assign(reports[result.reportIndex], { status: 'warn', message: error });
         }
       }
@@ -1410,7 +1453,7 @@
     let value = await generate(f, seed);
     const rule = ruleFor(f);
     const online = (rule.mode === 'text' ? rule.text?.mode : currentSettings().text.mode) === 'online';
-    for (let attempt = 0; attempt < 8 && !online && !cancelled && same(value, before); attempt++) value = await generate(f, `${seed}:${attempt}`);
+    for (let attempt = 0; attempt < 8 && !online && !cancelled && sameFieldValue(f, value, before); attempt++) value = await generate(f, `${seed}:${attempt}`);
     return value;
   }
   async function randomizeOne(reference) {
@@ -1431,12 +1474,12 @@
       if (cancelled || pageKey() !== page || !root.isConnected || rootScope() !== root || !f.el.isConnected) throw new Error('页面已变化或操作已停止，未写入');
       if (!matchLive(liveReference(f), collect(root)).field) throw new Error('生成期间控件标签或用途已变化，未写入');
       if (!same(read(f), before)) throw new Error('生成期间字段被修改，已保留新内容');
-      if (same(value, before)) { report(label, 'skip', '本次生成与原值相同，可调整规则或再次点击'); toast(`${label}：本次值相同，未改动`); return; }
+      if (sameFieldValue(f, value, before)) { report(label, 'skip', '本次生成与原值相同，可调整规则或再次点击'); toast(`${label}：本次值相同，未改动`); return; }
       const snapshot = { ...liveReference(f), value: before, after: undefined };
       history = [snapshot]; historyPage = page; historyRoot = root;
       try { await write(f, value); } finally { snapshot.after = read(f); }
       await sleep(160);
-      const error = fieldError(f) || (!same(read(f), snapshot.after) ? '页面联动改变了该值，请检查' : '');
+      const error = fieldError(f) || (!sameFieldValue(f, read(f), snapshot.after) ? '页面联动改变了该值，请检查' : '');
       report(label, error ? 'warn' : 'ok', error || '已单独更新此字段', f.desc);
       toast(error ? `${label}：${error}` : `已更新「${label}」`, true);
     } catch (error) { report(label, 'fail', error.message); toast(`${label}：${error.message}`); }
